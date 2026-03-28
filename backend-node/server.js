@@ -24,10 +24,136 @@ let smartAlerts = [];
 let waitlist = [];
 let savedCommutes = [];
 let bookingLedger = [];
+const userProfiles = new Map();
 let bookingCounter = 0;
 let reportCounter = 0;
 let waitlistCounter = 0;
 const BOOKING_HOLD_MS = 5 * 60 * 1000;
+const PROFILE_POINTS_PER_RIDE = 10;
+
+const profileTierFromRides = (ridesCompleted) => {
+  if (ridesCompleted >= 100) return 'Platinum Rider';
+  if (ridesCompleted >= 50) return 'Gold Rider';
+  if (ridesCompleted >= 20) return 'Silver Rider';
+  return 'Starter Rider';
+};
+
+const getOrCreateUserProfile = (userId = 'demo-user') => {
+  const safeUserId = String(userId || 'demo-user');
+  if (!userProfiles.has(safeUserId)) {
+    userProfiles.set(safeUserId, {
+      userId: safeUserId,
+      ridesCompleted: 0,
+      points: 0,
+      freeTicketCredits: 0,
+      freeTicketsRedeemed: 0,
+      lifetimeDiscountInr: 0,
+      tier: profileTierFromRides(0),
+      lastRideAt: null,
+      recentActivity: []
+    });
+  }
+  return userProfiles.get(safeUserId);
+};
+
+const resetUserProfile = (userId = 'demo-user') => {
+  const safeUserId = String(userId || 'demo-user');
+  const profile = {
+    userId: safeUserId,
+    ridesCompleted: 0,
+    points: 0,
+    freeTicketCredits: 0,
+    freeTicketsRedeemed: 0,
+    lifetimeDiscountInr: 0,
+    tier: profileTierFromRides(0),
+    lastRideAt: null,
+    recentActivity: []
+  };
+  userProfiles.set(safeUserId, profile);
+  return profile;
+};
+
+const pushProfileActivity = (profile, message) => {
+  profile.recentActivity.unshift({ message, at: new Date().toISOString() });
+  profile.recentActivity = profile.recentActivity.slice(0, 12);
+};
+
+const perksForProfile = (profile) => ({
+  discountUnlocked: profile.ridesCompleted >= 50,
+  discountPercent: profile.ridesCompleted >= 50 ? 20 : 0,
+  freeTicketCredits: profile.freeTicketCredits,
+  nextMilestone: profile.ridesCompleted < 50 ? 50 : profile.ridesCompleted < 100 ? 100 : (Math.floor(profile.ridesCompleted / 100) + 1) * 100,
+  ridesToNextMilestone:
+    profile.ridesCompleted < 50
+      ? 50 - profile.ridesCompleted
+      : profile.ridesCompleted < 100
+        ? 100 - profile.ridesCompleted
+        : ((Math.floor(profile.ridesCompleted / 100) + 1) * 100) - profile.ridesCompleted
+});
+
+const recentSeatBookingsForUser = (userId, limit = 6) => bookingLedger
+  .filter((booking) => booking.userId === userId && booking.status === 'confirmed')
+  .map((booking) => ({
+    bookingId: booking.bookingId,
+    busId: booking.busId,
+    busNumber: booking.number || `Bus ${booking.busId}`,
+    seats: booking.seats,
+    amount: booking.amount,
+    discountAmount: booking.discountAmount || 0,
+    freeTicketUsed: Boolean(booking.freeTicketUsed),
+    perkApplied: booking.perkApplied || 'none',
+    paymentProvider: booking.paymentProvider,
+    confirmedAt: booking.confirmedAt
+  }))
+  .slice(0, limit);
+
+const buildProfileDashboard = (profile) => ({
+  userId: profile.userId,
+  ridesCompleted: profile.ridesCompleted,
+  points: profile.points,
+  rideCounterRule: 'Each successful ticket purchase adds exactly +1 ride.',
+  tier: profileTierFromRides(profile.ridesCompleted),
+  lifetimeDiscountInr: profile.lifetimeDiscountInr,
+  freeTicketCredits: profile.freeTicketCredits,
+  freeTicketsRedeemed: profile.freeTicketsRedeemed,
+  lastRideAt: profile.lastRideAt,
+  perks: perksForProfile(profile),
+  milestones: {
+    discountAt50: {
+      target: 50,
+      reached: profile.ridesCompleted >= 50,
+      ridesRemaining: Math.max(0, 50 - profile.ridesCompleted)
+    },
+    freeTicketAt100: {
+      target: 100,
+      reached: profile.ridesCompleted >= 100,
+      ridesRemaining: Math.max(0, 100 - profile.ridesCompleted)
+    }
+  },
+  seatBookings: recentSeatBookingsForUser(profile.userId, 8),
+  recentActivity: profile.recentActivity
+});
+
+const awardRideRewards = (profile, booking) => {
+  const previousRides = profile.ridesCompleted;
+  const nextRides = previousRides + 1;
+
+  profile.ridesCompleted = nextRides;
+  profile.points += PROFILE_POINTS_PER_RIDE;
+  profile.tier = profileTierFromRides(nextRides);
+  profile.lastRideAt = new Date().toISOString();
+
+  if (previousRides < 50 && nextRides >= 50) {
+    pushProfileActivity(profile, 'Milestone unlocked: 20% ticket discount is now active after 50 rides.');
+  }
+
+  if (Math.floor(previousRides / 100) < Math.floor(nextRides / 100) && nextRides >= 100) {
+    profile.freeTicketCredits += 1;
+    pushProfileActivity(profile, 'Milestone unlocked: You earned 1 free ticket credit after 100 rides.');
+  }
+
+  pushProfileActivity(profile, `Ride completed on ${booking.number || 'Nexus bus'} | +${PROFILE_POINTS_PER_RIDE} points`);
+};
 
 const calculateDistance = (p1, p2) => data.haversine(p1.lat, p1.lng, p2.lat, p2.lng);
 
@@ -687,10 +813,15 @@ const seatsAvailableForBus = (bus) => Math.max(0, bus.capacity - bus.occupied - 
 
 const bookingPublicView = (booking) => ({
   bookingId: booking.bookingId,
+  userId: booking.userId,
   busId: booking.busId,
   seats: booking.seats,
+  baseAmount: booking.baseAmount,
+  discountAmount: booking.discountAmount,
   amount: booking.amount,
   reservationFee: booking.reservationFee,
+  perkApplied: booking.perkApplied,
+  freeTicketUsed: Boolean(booking.freeTicketUsed),
   status: booking.status,
   paymentStatus: booking.paymentStatus,
   paymentProvider: booking.paymentProvider,
@@ -829,6 +960,34 @@ app.get('/api/buses/safety', (req, res) => {
     ...buildBusSafetyMeta(bus)
   }));
   return res.json(payload);
+});
+
+app.get('/api/profile/:userId', (req, res) => {
+  const profile = getOrCreateUserProfile(req.params.userId);
+  return res.json(buildProfileDashboard(profile));
+});
+
+app.post('/api/profile/:userId/reset', (req, res) => {
+  const profile = resetUserProfile(req.params.userId);
+  pushProfileActivity(profile, 'Profile reset requested. Ride counter starts from 0.');
+  return res.json({ status: 'reset', profile: buildProfileDashboard(profile) });
+});
+
+app.get('/api/profile/:userId/rides', (req, res) => {
+  const userId = String(req.params.userId);
+  const rides = bookingLedger
+    .filter((booking) => booking.userId === userId && booking.status === 'confirmed')
+    .map((booking) => ({
+      bookingId: booking.bookingId,
+      busId: booking.busId,
+      amount: booking.amount,
+      discountAmount: booking.discountAmount,
+      freeTicketUsed: Boolean(booking.freeTicketUsed),
+      confirmedAt: booking.confirmedAt,
+      paymentProvider: booking.paymentProvider
+    }))
+    .slice(0, 80);
+  return res.json({ userId, rides });
 });
 
 app.post('/api/gemma/regenerate', async (req, res) => {
@@ -1169,7 +1328,8 @@ app.get('/api/eco-impact/:userId', (req, res) => {
 });
 
 app.post('/api/book', (req, res) => {
-  const { busId, seats } = req.body;
+  const { busId, seats, userId } = req.body;
+  const profile = getOrCreateUserProfile(userId || 'demo-user');
   const parsedSeats = Number(seats) || 0;
   const bus = buses.find((b) => b.id === Number(busId));
   const availableSeats = bus ? seatsAvailableForBus(bus) : 0;
@@ -1181,7 +1341,21 @@ app.post('/api/book', (req, res) => {
   bookingCounter += 1;
   const isFreeSeatWave = bookingCounter <= 50;
   const reservationFee = isFreeSeatWave ? 0 : parsedSeats * 2;
-  const totalAmount = parsedSeats * 15 + reservationFee;
+  const baseAmount = parsedSeats * 15 + reservationFee;
+  let discountAmount = 0;
+  let perkApplied = 'none';
+  let freeTicketUsed = false;
+
+  if (profile.freeTicketCredits > 0) {
+    freeTicketUsed = true;
+    perkApplied = '100_RIDES_FREE_TICKET';
+    discountAmount = baseAmount;
+  } else if (profile.ridesCompleted >= 50) {
+    perkApplied = '50_RIDES_DISCOUNT';
+    discountAmount = Math.round(baseAmount * 0.2);
+  }
+
+  const totalAmount = Math.max(0, baseAmount - discountAmount);
   const bookingId = makeId('BK');
   const createdAtMs = nowMs();
   const expiresAtMs = createdAtMs + BOOKING_HOLD_MS;
@@ -1189,10 +1363,16 @@ app.post('/api/book', (req, res) => {
 
   const booking = {
     bookingId,
+    userId: profile.userId,
+    number: bus.number,
     busId: bus.id,
     seats: parsedSeats,
+    baseAmount,
+    discountAmount,
     amount: totalAmount,
     reservationFee,
+    perkApplied,
+    freeTicketUsed,
     status: 'pending',
     paymentStatus: 'awaiting_payment',
     paymentProvider: null,
@@ -1213,14 +1393,20 @@ app.post('/api/book', (req, res) => {
 
   return res.json({
     bookingId,
+    userId: profile.userId,
     status: 'pending',
+    baseAmount,
+    discountAmount,
     amount: totalAmount,
     reservationFee,
+    perkApplied,
+    freeTicketUsed,
     freeSeatWaveApplied: isFreeSeatWave,
     expiresAt: booking.expiresAt,
     holdWindowSeconds: Math.floor(BOOKING_HOLD_MS / 1000),
     seatsHeld: parsedSeats,
     seatsRemainingAfterHold: availableSeats - parsedSeats,
+    profilePreview: buildProfileDashboard(profile),
     paymentOptions: [
       {
         provider: 'razorpay',
@@ -1261,6 +1447,8 @@ app.post('/api/payment/success', (req, res) => {
     return res.status(400).json({ error: 'Bus not found for booking' });
   }
 
+  const profile = getOrCreateUserProfile(booking.userId || 'demo-user');
+
   bus.occupied = Math.min(bus.capacity, bus.occupied + booking.seats);
   booking.status = 'confirmed';
   booking.paymentStatus = 'paid';
@@ -1268,12 +1456,24 @@ app.post('/api/payment/success', (req, res) => {
   booking.transactionId = transactionId || makeId('TXN');
   booking.confirmedAt = new Date().toISOString();
 
+  if (booking.freeTicketUsed && profile.freeTicketCredits > 0) {
+    profile.freeTicketCredits -= 1;
+    profile.freeTicketsRedeemed += 1;
+    pushProfileActivity(profile, 'Free ticket credit redeemed automatically on this booking.');
+  }
+
+  profile.lifetimeDiscountInr += booking.discountAmount || 0;
+  awardRideRewards(profile, booking);
+
   io.emit('booking-update', {
     bookingId: booking.bookingId,
     status: booking.status,
     busId: booking.busId,
     seats: booking.seats,
-    transactionId: booking.transactionId
+    transactionId: booking.transactionId,
+    userId: booking.userId,
+    ridesCompleted: profile.ridesCompleted,
+    points: profile.points
   });
 
   return res.json({
@@ -1281,14 +1481,20 @@ app.post('/api/payment/success', (req, res) => {
     ticket: {
       ticketId: makeId('TKT'),
       bookingId: booking.bookingId,
+      userId: booking.userId,
       busId: booking.busId,
       seats: booking.seats,
+      baseAmount: booking.baseAmount,
+      discountAmount: booking.discountAmount,
       amount: booking.amount,
+      perkApplied: booking.perkApplied,
+      freeTicketUsed: booking.freeTicketUsed,
       paymentProvider: booking.paymentProvider,
       transactionId: booking.transactionId,
       confirmedAt: booking.confirmedAt
     },
-    booking: bookingPublicView(booking)
+    booking: bookingPublicView(booking),
+    profile: buildProfileDashboard(profile)
   });
 });
 

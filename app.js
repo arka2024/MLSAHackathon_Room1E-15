@@ -1,11 +1,20 @@
-const { useEffect, useMemo, useRef, useState } = React;
+const { useEffect, useMemo, useState, useCallback } = React;
 
 const tabs = [
   { id: "home", label: "Home" },
-  { id: "routes", label: "Routes" },
   { id: "tracking", label: "Tracking" },
   { id: "schedule", label: "Schedule" }
 ];
+
+const BACKEND_BASE = "http://localhost:5000";
+
+const DEFAULT_NOTIFICATION_SETTINGS = {
+  busNear: true,
+  seatHold: true,
+  bookingConfirmed: true,
+  safety: true,
+  smartStop: true
+};
 
 const corridorRoutes = [
   {
@@ -281,32 +290,10 @@ function createLiveBuses(path, locations, liveAnchorId) {
   });
 }
 
-function rankBusesWithAIModel(buses, options = {}) {
-  const optimizeFor = options.optimizeFor || "balanced";
-  const userType = options.userType || "general";
-
+function rankBusesWithAIModel(buses) {
   return [...buses].sort((a, b) => {
-    const seatsA = Number.isFinite(a.predictedSeatsAtYourStop) ? a.predictedSeatsAtYourStop : a.seats;
-    const seatsB = Number.isFinite(b.predictedSeatsAtYourStop) ? b.predictedSeatsAtYourStop : b.seats;
-    const safetyA = Number.isFinite(a.safetyScore) ? a.safetyScore : 70;
-    const safetyB = Number.isFinite(b.safetyScore) ? b.safetyScore : 70;
-
-    let scoreA = a.eta * 2.2 + (a.isFull ? 15 : 0) - seatsA * 0.55 + a.load * 0.02;
-    let scoreB = b.eta * 2.2 + (b.isFull ? 15 : 0) - seatsB * 0.55 + b.load * 0.02;
-
-    if (optimizeFor === "seat-guarantee") {
-      scoreA -= seatsA * 0.7;
-      scoreB -= seatsB * 0.7;
-    }
-    if (optimizeFor === "fastest") {
-      scoreA += a.eta * 0.6;
-      scoreB += b.eta * 0.6;
-    }
-    if (optimizeFor === "women-safety" || userType === "woman" || userType === "elderly") {
-      scoreA -= (a.isWomenFriendly ? 8 : 0) + (safetyA * 0.06);
-      scoreB -= (b.isWomenFriendly ? 8 : 0) + (safetyB * 0.06);
-    }
-
+    const scoreA = a.eta * 2.1 + (a.load || 0) * 0.05 - (a.safetyScore || 70) * 0.02 - (a.nexusScore || 70) * 0.01;
+    const scoreB = b.eta * 2.1 + (b.load || 0) * 0.05 - (b.safetyScore || 70) * 0.02 - (b.nexusScore || 70) * 0.01;
     return scoreA - scoreB;
   });
 }
@@ -315,8 +302,65 @@ function App() {
   const [activeTab, setActiveTab] = useState("home");
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [day, setDay] = useState("Weekday");
+  const [notifications, setNotifications] = useState([]);
+  const PROFILE_USER_ID = "demo-user";
+  const [profileDashboard, setProfileDashboard] = useState(null);
+  const [notificationSettings, setNotificationSettings] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem("nexus-notification-settings");
+      if (!saved) return DEFAULT_NOTIFICATION_SETTINGS;
+      const parsed = JSON.parse(saved);
+      return { ...DEFAULT_NOTIFICATION_SETTINGS, ...parsed };
+    } catch (_error) {
+      return DEFAULT_NOTIFICATION_SETTINGS;
+    }
+  });
 
   const currentTime = useClock();
+
+  const pushNotification = useCallback((title, message, kind = "info", category = "smartStop") => {
+    const categoryMap = {
+      busNear: "busNear",
+      seatHold: "seatHold",
+      bookingConfirmed: "bookingConfirmed",
+      safety: "safety",
+      smartStop: "smartStop"
+    };
+    const mappedCategory = categoryMap[category] || "smartStop";
+    if (!notificationSettings[mappedCategory]) return;
+
+    const next = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      message,
+      kind,
+      category: mappedCategory,
+      createdAt: new Date().toISOString()
+    };
+    setNotifications((prev) => [next, ...prev].slice(0, 40));
+  }, [notificationSettings]);
+
+  useEffect(() => {
+    window.localStorage.setItem("nexus-notification-settings", JSON.stringify(notificationSettings));
+  }, [notificationSettings]);
+
+  const refreshProfileDashboard = useCallback(async () => {
+    try {
+      const response = await fetch(`${BACKEND_BASE}/api/profile/${PROFILE_USER_ID}`);
+      if (!response.ok) throw new Error("Profile feed unavailable");
+      const payload = await response.json();
+      setProfileDashboard(payload);
+    } catch (_error) {
+      setProfileDashboard(null);
+    }
+  }, [PROFILE_USER_ID]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    refreshProfileDashboard();
+  }, [isAuthenticated, refreshProfileDashboard]);
+
+  const clearNotifications = () => setNotifications([]);
 
   const visibleTabs = tabs.filter(t => isAuthenticated || t.id === "home");
 
@@ -333,16 +377,33 @@ function App() {
           onTabChange={setActiveTab} 
           visibleTabs={visibleTabs} 
           isAuthenticated={isAuthenticated} 
+          notifications={notifications}
+          notificationSettings={notificationSettings}
+          profileDashboard={profileDashboard}
+          profileUserId={PROFILE_USER_ID}
+          onRefreshProfile={refreshProfileDashboard}
+          onNotificationSettingChange={(key, value) => {
+            setNotificationSettings((prev) => ({ ...prev, [key]: value }));
+          }}
+          onClearNotifications={clearNotifications}
         />
 
         <main className="main-flow">
           {activeTab === "home" && <HomeView onRouteClick={() => setActiveTab("auth")} onScheduleClick={() => setActiveTab("auth")} />}
-          {activeTab === "tracking" && isAuthenticated && <TrackingView currentTime={currentTime} />}
+          {activeTab === "tracking" && isAuthenticated && (
+            <TrackingView
+              currentTime={currentTime}
+              onNotify={pushNotification}
+              userId={PROFILE_USER_ID}
+              onTicketPurchased={refreshProfileDashboard}
+            />
+          )}
           {activeTab === "schedule" && isAuthenticated && (
             <ScheduleView
               day={day}
               setDay={setDay}
               onMapOpen={() => setActiveTab("tracking")}
+              onNotify={pushNotification}
             />
           )}
           {activeTab === "auth" && <AuthView onLoginSuccess={handleLoginSuccess} />}
@@ -383,7 +444,32 @@ function App() {
   );
 }
 
-function TopNav({ activeTab, onTabChange, visibleTabs, isAuthenticated }) {
+function TopNav({
+  activeTab,
+  onTabChange,
+  visibleTabs,
+  isAuthenticated,
+  notifications,
+  notificationSettings,
+  profileDashboard,
+  profileUserId,
+  onRefreshProfile,
+  onNotificationSettingChange,
+  onClearNotifications
+}) {
+  const [isBellOpen, setIsBellOpen] = useState(false);
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
+
+  const handleProfileOpen = async () => {
+    const next = !isProfileOpen;
+    setIsProfileOpen(next);
+    if (next) {
+      await onRefreshProfile?.();
+    }
+  };
+
+  const bellCount = notifications.length;
+
   return (
     <header className="top-nav">
       <div className="brand-wrap">
@@ -412,11 +498,174 @@ function TopNav({ activeTab, onTabChange, visibleTabs, isAuthenticated }) {
       </nav>
 
       <div className="nav-actions">
-        <button type="button" className="text-btn">Emergency Alerts</button>
+        <button
+          type="button"
+          className="bell-btn"
+          aria-label="Notification Center"
+          onClick={() => setIsBellOpen((prev) => !prev)}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
+            <path d="M13.73 21a2 2 0 01-3.46 0" />
+          </svg>
+          {bellCount > 0 && <span className="bell-badge">{bellCount > 9 ? "9+" : bellCount}</span>}
+        </button>
+
+        {isAuthenticated && (
+          <button
+            type="button"
+            className="profile-btn"
+            aria-label="Profile Dashboard"
+            onClick={handleProfileOpen}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2" />
+              <circle cx="12" cy="7" r="4" />
+            </svg>
+          </button>
+        )}
         {!isAuthenticated ? (
           <button type="button" className="solid-btn" onClick={() => onTabChange("auth")}>Sign In</button>
         ) : (
           <button type="button" className="soft-btn" style={{ fontWeight: 'bold' }}>Signed In</button>
+        )}
+
+        {isBellOpen && (
+          <div className="notification-drawer glass-card">
+            <div className="notification-head">
+              <h4>Notifications</h4>
+              <button type="button" className="text-btn" onClick={onClearNotifications}>Clear</button>
+            </div>
+            <div className="notification-settings-grid">
+              <label className="notify-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(notificationSettings?.busNear)}
+                  onChange={(event) => onNotificationSettingChange?.("busNear", event.target.checked)}
+                />
+                <span>Bus Near</span>
+              </label>
+              <label className="notify-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(notificationSettings?.seatHold)}
+                  onChange={(event) => onNotificationSettingChange?.("seatHold", event.target.checked)}
+                />
+                <span>Seat Hold</span>
+              </label>
+              <label className="notify-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(notificationSettings?.bookingConfirmed)}
+                  onChange={(event) => onNotificationSettingChange?.("bookingConfirmed", event.target.checked)}
+                />
+                <span>Booking Confirmed</span>
+              </label>
+              <label className="notify-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(notificationSettings?.safety)}
+                  onChange={(event) => onNotificationSettingChange?.("safety", event.target.checked)}
+                />
+                <span>Safety Alerts</span>
+              </label>
+              <label className="notify-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(notificationSettings?.smartStop)}
+                  onChange={(event) => onNotificationSettingChange?.("smartStop", event.target.checked)}
+                />
+                <span>Smart Stop</span>
+              </label>
+            </div>
+            <div className="notification-list">
+              {notifications.length === 0 ? (
+                <p className="notification-empty">No alerts yet. We will notify when your bus is near and when seats are confirmed.</p>
+              ) : (
+                notifications.map((note) => (
+                  <article key={note.id} className={`notification-item ${note.kind}`}>
+                    <strong>{note.title}</strong>
+                    <p>{note.message}</p>
+                  </article>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {isProfileOpen && isAuthenticated && (
+          <div className="profile-drawer glass-card">
+            <div className="profile-head">
+              <h4>Rider Profile</h4>
+              <button type="button" className="text-btn" onClick={() => setIsProfileOpen(false)}>Close</button>
+            </div>
+
+            {!profileDashboard ? (
+              <p className="profile-empty">Profile loading. Please try again in a moment.</p>
+            ) : (
+              <>
+                <div className="profile-meta">
+                  <span>User: {profileUserId}</span>
+                  <span>Tier: {profileDashboard.tier}</span>
+                </div>
+
+                <div className="profile-stats-grid">
+                  <article>
+                    <strong>{profileDashboard.ridesCompleted}</strong>
+                    <small>Total Rides</small>
+                  </article>
+                  <article>
+                    <strong>{profileDashboard.points}</strong>
+                    <small>Gamified Points</small>
+                  </article>
+                  <article>
+                    <strong>Rs {profileDashboard.lifetimeDiscountInr || 0}</strong>
+                    <small>Lifetime Savings</small>
+                  </article>
+                </div>
+
+                <div className="profile-perk-card">
+                  <h5>Automated Perks</h5>
+                  <p><strong>Ride Counter Rule:</strong> Each successful Buy Ticket adds exactly +1 ride.</p>
+                  <p>50 rides: 20% discount on ticket fare.</p>
+                  <p>100 rides: 1 free ticket credit automatically applied.</p>
+                  <p>Available free ticket credits: <strong>{profileDashboard.freeTicketCredits || 0}</strong></p>
+                  <p>Rides to next milestone: <strong>{profileDashboard.perks?.ridesToNextMilestone ?? "--"}</strong></p>
+                </div>
+
+                <div className="profile-activity">
+                  <h5>Seat Booking History</h5>
+                  {Array.isArray(profileDashboard.seatBookings) && profileDashboard.seatBookings.length > 0 ? (
+                    profileDashboard.seatBookings.slice(0, 5).map((item) => (
+                      <article key={item.bookingId} className="profile-activity-item">
+                        <p>
+                          {item.busNumber} | Seats: {item.seats} | Paid: Rs {item.amount}
+                        </p>
+                        <p>
+                          {item.freeTicketUsed ? "Free Ticket Used" : `Discount: Rs ${item.discountAmount || 0}`} | {item.paymentProvider || "N/A"}
+                        </p>
+                      </article>
+                    ))
+                  ) : (
+                    <p className="profile-empty">No seat bookings yet. Buy a ticket to populate this section.</p>
+                  )}
+                </div>
+
+                <div className="profile-activity">
+                  <h5>Recent Ride Activity</h5>
+                  {Array.isArray(profileDashboard.recentActivity) && profileDashboard.recentActivity.length > 0 ? (
+                    profileDashboard.recentActivity.slice(0, 5).map((item) => (
+                      <article key={`${item.at}-${item.message}`} className="profile-activity-item">
+                        <p>{item.message}</p>
+                      </article>
+                    ))
+                  ) : (
+                    <p className="profile-empty">No rides yet. Buy a ticket in Tracking to start earning points.</p>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
         )}
       </div>
     </header>
@@ -431,10 +680,6 @@ function HomeView({ onRouteClick, onScheduleClick }) {
         <div className="hero-glow hero-glow-a" aria-hidden="true" />
         <div className="hero-glow hero-glow-b" aria-hidden="true" />
         
-        <div className="overlapping-bus" aria-hidden="true">
-          <img src="https://i.postimg.cc/8PnvY73Y/bus-isolate.png" alt="Bus overlap illustration" className="slide-bus" />
-        </div>
-
         <div className="hero-grid page-grid">
           <div className="hero-copy reveal" style={{ animationDelay: "0.08s" }}>
             <span className="live-chip">
@@ -630,46 +875,29 @@ function TrackingMap({
 
     routeLayerRef.current.clearLayers();
 
-    if (shortestPath.length > 1) {
-      const shortestLatLng = shortestPath.map((location) => [location.lat, location.lng]);
-      L.polyline(shortestLatLng, {
-        color: '#60a5fa',
-        weight: 14,
-        opacity: 0.24,
+    const optimizedPath = fastestPath.length > 1 ? fastestPath : shortestPath;
+
+    if (optimizedPath.length > 1) {
+      const optimizedLatLng = optimizedPath.map((location) => [location.lat, location.lng]);
+
+      // Route halo improves visibility over busy map tiles.
+      L.polyline(optimizedLatLng, {
+        color: '#ffffff',
+        weight: 11,
+        opacity: 0.95,
         lineJoin: 'round',
         pane: 'routePane'
       }).addTo(routeLayerRef.current);
 
-      const shortestPolyline = L.polyline(shortestLatLng, {
-        color: '#2563eb',
+      const optimizedPolyline = L.polyline(optimizedLatLng, {
+        color: '#1d4ed8',
         weight: 7,
         opacity: 0.98,
         lineJoin: 'round',
-        dashArray: '10, 8',
         pane: 'routePane'
       }).addTo(routeLayerRef.current);
 
-      mapInstance.current.fitBounds(shortestPolyline.getBounds(), { padding: [50, 50], maxZoom: 14 });
-    }
-
-    if (fastestPath.length > 1) {
-      const fastestLatLng = fastestPath.map((location) => [location.lat, location.lng]);
-      L.polyline(fastestLatLng, {
-        color: '#34d399',
-        weight: 12,
-        opacity: 0.22,
-        lineJoin: 'round',
-        pane: 'routePane'
-      }).addTo(routeLayerRef.current);
-
-      L.polyline(fastestLatLng, {
-        color: '#059669',
-        weight: 6,
-        opacity: 0.96,
-        lineJoin: 'round',
-        dashArray: '4, 7',
-        pane: 'routePane'
-      }).addTo(routeLayerRef.current);
+      mapInstance.current.fitBounds(optimizedPolyline.getBounds(), { padding: [60, 60], maxZoom: 14 });
     }
 
     if (liveMarkerRef.current) {
@@ -800,8 +1028,8 @@ function TrackingMap({
   return <div className="map-surface" ref={mapRef} style={{ zIndex: 0 }} />;
 }
 
-function TrackingView({ currentTime }) {
-  const backendBase = "http://localhost:5000";
+function TrackingView({ currentTime, onNotify, userId, onTicketPurchased }) {
+  const backendBase = BACKEND_BASE;
   const [locations, setLocations] = useState([]);
   const [fromId, setFromId] = useState(1);
   const [toId, setToId] = useState(3);
@@ -816,22 +1044,15 @@ function TrackingView({ currentTime }) {
   const [nexusAiConfidence, setNexusAiConfidence] = useState(98);
   const [userLocation, setUserLocation] = useState(null);
   const [userSpeedKmph, setUserSpeedKmph] = useState(4.5);
-  const [userType, setUserType] = useState("general");
-  const [optimizeFor, setOptimizeFor] = useState("balanced");
   const [aiSuggestion, setAiSuggestion] = useState(null);
-  const [smartStopAssistant, setSmartStopAssistant] = useState(null);
-  const [guaranteedSeatBus, setGuaranteedSeatBus] = useState(null);
-  const [alternativeStopOption, setAlternativeStopOption] = useState(null);
   const [walletBalance, setWalletBalance] = useState(2000);
   const [paymentMethod, setPaymentMethod] = useState("UPI");
   const [selectedBusId, setSelectedBusId] = useState("");
-  const [seatsToBook, setSeatsToBook] = useState(1);
-  const [bookingMessage, setBookingMessage] = useState("Select a bus to reserve seat and pay instantly.");
+  const [bookingMessage, setBookingMessage] = useState("Select a bus and buy ticket instantly.");
   const [selectedBackendBusId, setSelectedBackendBusId] = useState(null);
-  const [notifications, setNotifications] = useState([]);
+  const notifiedBusNearRef = React.useRef(new Set());
 
   const [buses, setBuses] = useState([]);
-  const arrivalAlertRef = useRef(new Set());
   const nearestLiveLocation = useMemo(
     () => (livePoint && locations.length ? getNearestLocation(livePoint, locations) : null),
     [livePoint, locations]
@@ -848,6 +1069,23 @@ function TrackingView({ currentTime }) {
     () => (userLocation && locations.length ? getNearestLocation(userLocation, locations) : null),
     [userLocation, locations]
   );
+  const nearestFootStops = useMemo(() => {
+    if (!userLocation || !locations.length) return [];
+
+    return locations
+      .map((location) => ({
+        ...location,
+        distanceKm: getDistanceKm(userLocation, location)
+      }))
+      .sort((a, b) => a.distanceKm - b.distanceKm)
+      .slice(0, 3)
+      .map((item, index) => ({
+        ...item,
+        walkMeters: Math.round(item.distanceKm * 1000),
+        walkMinutes: Math.max(1, Math.round((item.distanceKm / Math.max(1.2, userSpeedKmph)) * 60)),
+        tip: index === 0 ? "Best nearby footstop" : index === 1 ? "Backup stop" : "Alternative stop"
+      }));
+  }, [userLocation, locations, userSpeedKmph]);
   const guidancePath = useMemo(() => {
     if (!userLocation || !nearestStopFromUser) return [];
     const points = [
@@ -864,25 +1102,8 @@ function TrackingView({ currentTime }) {
     [userLocation, nearestStopFromUser]
   );
 
-  const rankedBuses = useMemo(
-    () => rankBusesWithAIModel(buses, { optimizeFor, userType }),
-    [buses, optimizeFor, userType]
-  );
+  const rankedBuses = useMemo(() => rankBusesWithAIModel(buses), [buses]);
   const firstArrivingBus = rankedBuses[0];
-  const firstVacantBus = rankedBuses.find((bus) => !bus.isFull && bus.seats > 0);
-
-  const addNotification = (title, message, kind = "info") => {
-    setNotifications((prev) => {
-      const item = {
-        id: `NTF-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-        title,
-        message,
-        kind,
-        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      };
-      return [item, ...prev].slice(0, 12);
-    });
-  };
 
   const mapTripBuses = (tripBuses, routeName) =>
     (tripBuses || []).map((bus) => ({
@@ -891,18 +1112,15 @@ function TrackingView({ currentTime }) {
       line: bus.number,
       road: routeName,
       eta: bus.etaMinutes,
-      seats: bus.seatsLeft,
-      isFull: bus.seatsLeft <= 0,
       load: Math.round(((40 - bus.seatsLeft) / 40) * 100),
       fare: 15,
       nexusScore: bus.nexusScore || 72,
       confidencePercent: bus.confidencePercent || 75,
-      predictedSeatsAtYourStop: Number.isFinite(bus.predictedSeatsAtYourStop) ? bus.predictedSeatsAtYourStop : bus.seatsLeft,
       boardingAdvice: bus.boardingAdvice || "Stand near MIDDLE door",
       boardingZoneHint: bus.boardingZoneHint || "Middle door, 10m ahead",
-      safetyScore: Number.isFinite(bus.safetyScore) ? bus.safetyScore : 70,
-      isWomenFriendly: Boolean(bus.isWomenFriendly),
-      womenPriority: bus.womenPriority || "Standard Bus"
+      safetyScore: typeof bus.safetyScore === "number" ? bus.safetyScore : bus.isWomenFriendly ? 88 : 72,
+      womenPriority: bus.womenPriority || (bus.isWomenFriendly ? "Women & Elderly Priority Bus" : "Standard Bus"),
+      isWomenFriendly: Boolean(bus.isWomenFriendly)
     }));
 
   const fetchLocations = async () => {
@@ -938,8 +1156,6 @@ function TrackingView({ currentTime }) {
         body: JSON.stringify({
           fromId: Number(fromId),
           toId: Number(toId),
-          userType,
-          optimizeFor,
           userLat: userLocation ? Number(userLocation.lat) : undefined,
           userLng: userLocation ? Number(userLocation.lng) : undefined,
           userSpeedKmph: Number(userSpeedKmph)
@@ -971,11 +1187,24 @@ function TrackingView({ currentTime }) {
       }
 
       setNexusAiConfidence(payload.nexusAiConfidence || 98);
-      setAiSuggestion(payload.aiSuggestion || null);
-      setSmartStopAssistant(payload.smartStopAssistant || null);
-      setGuaranteedSeatBus(payload.guaranteedSeatBus || null);
-      setAlternativeStopOption(payload.alternativeStopOption || null);
+      setAiSuggestion(payload.aiSuggestion || payload.smartStopAssistant || null);
       setBookingMessage(payload.message || "Live route loaded from backend.");
+
+      if (payload.smartStopAssistant?.status === "guaranteed-seat-bus") {
+        onNotify?.(
+          "Recommended Bus",
+          `${payload.smartStopAssistant.recommendedBusNumber} in ~${payload.guaranteedSeatBus?.etaMinutes || payload.smartStopAssistant.etaMinutes || "--"} mins. ${payload.smartStopAssistant.boardingZoneHint || "Stand near front door."}`,
+          "success",
+          "smartStop"
+        );
+      } else if (payload.smartStopAssistant?.status === "walk-alternative-stop" && payload.alternativeStopOption) {
+        onNotify?.(
+          "Walk To Better Footstop",
+          `Walk ${payload.alternativeStopOption.walkMeters}m to ${payload.alternativeStopOption.stopName} for faster pickup.`,
+          "warn",
+          "smartStop"
+        );
+      }
     } catch (error) {
       setBookingMessage(`Trip planning failed: ${error.message}`);
     }
@@ -988,7 +1217,7 @@ function TrackingView({ currentTime }) {
   useEffect(() => {
     if (!locations.length) return;
     handleSearch();
-  }, [locations.length, fromId, toId, userType, optimizeFor]);
+  }, [locations.length, fromId, toId]);
 
   useEffect(() => {
     if (!navigator.geolocation) return undefined;
@@ -1037,53 +1266,55 @@ function TrackingView({ currentTime }) {
             ? {
                 ...bus,
                 eta: update.etaToNextStop,
-                seats: Math.max(0, update.capacity - update.occupied),
-                isFull: update.capacity - update.occupied <= 0,
                 load: Math.round((update.occupied / update.capacity) * 100)
               }
             : bus
         )
       );
+
+      if (userLocation) {
+        const distanceToUserKm = getDistanceKm(userLocation, { lat: update.lat, lng: update.lng });
+        if (distanceToUserKm <= 0.45 && !notifiedBusNearRef.current.has(update.busId)) {
+          notifiedBusNearRef.current.add(update.busId);
+          onNotify?.(
+            "Bus Near Your Stop",
+            `${update.number} is ${(distanceToUserKm * 1000).toFixed(0)}m away. Move to boarding zone now.`,
+            "info",
+            "busNear"
+          );
+        }
+      }
     });
 
     socket.on("booking-update", (payload) => {
-      addNotification(
-        "Seat Booked",
-        `Booking ${payload.bookingId} confirmed for Bus ${payload.busId} (${payload.seats} seat${payload.seats > 1 ? "s" : ""}).`,
-        "success"
+      onNotify?.(
+        "Booking Confirmed",
+        `Booking ${payload.bookingId} confirmed for bus ${payload.busId}.`,
+        "success",
+        "bookingConfirmed"
       );
     });
 
     socket.on("booking-expired", (payload) => {
-      addNotification("Booking Hold Expired", `${payload.count} pending hold${payload.count > 1 ? "s" : ""} expired.`, "warn");
-    });
-
-    socket.on("new-alert", (payload) => {
-      addNotification("Community Alert", payload.message || "A new transit alert was reported.", "warn");
+      onNotify?.(
+        "Booking Hold Expired",
+        `${payload.count} pending bookings expired. Rebook to continue journey.`,
+        "warn",
+        "seatHold"
+      );
     });
 
     socket.on("safety-alert", (payload) => {
-      addNotification("Safety Alert", payload.message || "Safety issue reported by commuters.", "alert");
+      onNotify?.(
+        "Safety Alert",
+        payload.message || `Issue reported for bus ${payload.busId}`,
+        "danger",
+        "safety"
+      );
     });
 
     return () => socket.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (!selectedBackendBusId || !departureLocation) return;
-    const trackedBus = busPositions.find((bus) => Number(bus.busId) === Number(selectedBackendBusId));
-    if (!trackedBus) return;
-
-    const key = `${trackedBus.busId}-${trackedBus.etaToNextStop}`;
-    if (trackedBus.etaToNextStop <= 2 && !arrivalAlertRef.current.has(key)) {
-      arrivalAlertRef.current.add(key);
-      addNotification(
-        "Bus Arriving",
-        `${trackedBus.number} is arriving near ${departureLocation.name} in ~${trackedBus.etaToNextStop} min. Get ready to board.`,
-        "info"
-      );
-    }
-  }, [busPositions, selectedBackendBusId, departureLocation]);
+  }, [onNotify, userLocation]);
 
   const handleBook = async () => {
     if (!selectedBusId) {
@@ -1097,17 +1328,7 @@ function TrackingView({ currentTime }) {
       return;
     }
 
-    if (chosenBus.seats < seatsToBook || chosenBus.isFull) {
-      const alternative = rankedBuses.find((bus) => !bus.isFull && bus.seats >= seatsToBook);
-      setBookingMessage(
-        alternative
-          ? `Selected bus is full. Next vacant option: ${alternative.line} (${alternative.eta} min).`
-          : "No bus currently has required vacant seats. You can still track full incoming buses below."
-      );
-      return;
-    }
-
-    const totalFare = chosenBus.fare * seatsToBook;
+    const totalFare = chosenBus.fare;
     if (walletBalance < totalFare) {
       setBookingMessage(`Insufficient balance for ${paymentMethod}. Required Rs ${totalFare}.`);
       return;
@@ -1117,47 +1338,69 @@ function TrackingView({ currentTime }) {
       const response = await fetch(`${backendBase}/api/book`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ busId: chosenBus.backendBusId, seats: seatsToBook })
+        body: JSON.stringify({ busId: chosenBus.backendBusId, seats: 1, userId: userId || "demo-user" })
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Booking failed");
 
-      const paymentResponse = await fetch(`${backendBase}/api/payment/success`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          bookingId: payload.bookingId,
-          paymentProvider: paymentMethod,
-          transactionId: `NX-${Date.now()}`
-        })
-      });
-      const paymentPayload = await paymentResponse.json();
-      if (!paymentResponse.ok) throw new Error(paymentPayload.error || "Payment confirmation failed");
-
-      const finalAmount = paymentPayload?.booking?.amount || payload.amount || totalFare;
-
-      setWalletBalance((prev) => Math.max(0, prev - finalAmount));
+      setWalletBalance((prev) => prev - totalFare);
       setBuses((prev) =>
         prev.map((bus) =>
           bus.id === chosenBus.id
             ? {
                 ...bus,
-                seats: Math.max(0, bus.seats - seatsToBook),
-                isFull: bus.seats - seatsToBook <= 0,
-                load: Math.min(100, bus.load + seatsToBook * 3)
+                load: Math.min(100, bus.load + 3)
               }
             : bus
         )
       );
-      setBookingMessage(`Seat booked successfully. Booking ${payload.bookingId} | Paid Rs ${finalAmount}.`);
-      addNotification(
-        "Seat Booked",
-        `${chosenBus.line} confirmed with ${seatsToBook} seat${seatsToBook > 1 ? "s" : ""}. Txn ${paymentPayload?.ticket?.transactionId || "N/A"}`,
-        "success"
+      const perkText = payload.perkApplied === "100_RIDES_FREE_TICKET"
+        ? "Free ticket credit applied"
+        : payload.perkApplied === "50_RIDES_DISCOUNT"
+          ? "20% loyalty discount applied"
+          : "Standard fare";
+      setBookingMessage(`Ticket hold ${payload.bookingId} created. Amount: Rs ${payload.amount}. ${perkText}.`);
+      onNotify?.(
+        "Ticket Hold Created",
+        `Ticket hold created for ${chosenBus.line}. Complete payment to confirm.`,
+        "info",
+        "seatHold"
       );
+
+      const confirmResponse = await fetch(`${backendBase}/api/payment/success`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bookingId: payload.bookingId,
+          paymentProvider: paymentMethod,
+          transactionId: `SIM-${Date.now()}`
+        })
+      });
+      const confirmPayload = await confirmResponse.json();
+      if (confirmResponse.ok && confirmPayload.status === "confirmed") {
+        const ridesCompleted = confirmPayload.profile?.ridesCompleted;
+        const points = confirmPayload.profile?.points;
+        const perkApplied = confirmPayload.ticket?.perkApplied;
+        const rewardNote = ridesCompleted != null && points != null
+          ? `Rides: ${ridesCompleted} | Points: ${points}.`
+          : "";
+        const perkNote = perkApplied === "100_RIDES_FREE_TICKET"
+          ? "100-ride free ticket applied."
+          : perkApplied === "50_RIDES_DISCOUNT"
+            ? "50-ride discount applied."
+            : "";
+        setBookingMessage(`Ticket confirmed. Ticket ${confirmPayload.ticket.ticketId} issued. ${perkNote} ${rewardNote}`.trim());
+        onNotify?.(
+          "Ticket Confirmed",
+          `Ticket ${confirmPayload.ticket.ticketId} confirmed for ${chosenBus.line}.`,
+          "success",
+          "bookingConfirmed"
+        );
+        onTicketPurchased?.();
+      }
     } catch (error) {
       setBookingMessage(`Booking failed: ${error.message}`);
-      addNotification("Booking Failed", error.message, "alert");
+      onNotify?.("Booking Failed", error.message, "danger", "bookingConfirmed");
     }
   };
 
@@ -1193,24 +1436,6 @@ function TrackingView({ currentTime }) {
                 ))}
               </select>
             </label>
-            <label>
-              <span>User Profile</span>
-              <select value={userType} onChange={(event) => setUserType(event.target.value)}>
-                <option value="general">General</option>
-                <option value="woman">Woman</option>
-                <option value="elderly">Elderly</option>
-                <option value="student">Student</option>
-              </select>
-            </label>
-            <label>
-              <span>Optimize For</span>
-              <select value={optimizeFor} onChange={(event) => setOptimizeFor(event.target.value)}>
-                <option value="balanced">Balanced ETA + Seats</option>
-                <option value="seat-guarantee">Seat Guarantee</option>
-                <option value="fastest">Fastest Arrival</option>
-                <option value="women-safety">Women Safety Priority</option>
-              </select>
-            </label>
             <button type="button" className="solid-btn wide" onClick={handleSearch}>Search Routes</button>
             <button
               type="button"
@@ -1221,31 +1446,27 @@ function TrackingView({ currentTime }) {
             </button>
 
             <div className="route-metrics glass-card">
-              <div className="metric-grid">
-                <article>
-                  <span>Signal</span>
-                  <strong>{socketConnected ? "Live" : "Offline"}</strong>
+              <p><strong>Live Source:</strong> Nexus Neural Net</p>
+              <p><strong>Socket:</strong> {socketConnected ? "Connected" : "Disconnected"}</p>
+              <p><strong>AI Confidence:</strong> {nexusAiConfidence}%</p>
+              <p><strong>Your Speed:</strong> {userSpeedKmph.toFixed(1)} km/h</p>
+              <p><strong>Nearest Stop:</strong> {nearestStopFromUser ? nearestStopFromUser.name : "Locating..."}</p>
+              <p><strong>Tracker:</strong> {nearestStopFromUser ? `${guidanceDirection} • ${(nearestStopFromUser.distance * 1000).toFixed(0)} m` : "Enable location permission"}</p>
+              <p><strong>Shortest:</strong> {tripDistanceKm > 0 ? `${tripDistanceKm.toFixed(2)} km (Blue)` : "N/A"}</p>
+              <p><strong>Optimized:</strong> {tripFastestMin > 0 ? `${tripFastestMin.toFixed(1)} min highlighted route` : "N/A"}</p>
+            </div>
+
+            <div className="footstop-cards">
+              {nearestFootStops.map((stop) => (
+                <article key={stop.id} className="footstop-card glass-card lift-card">
+                  <div className="footstop-head">
+                    <strong>{stop.name}</strong>
+                    <span>{stop.walkMeters}m</span>
+                  </div>
+                  <p>{stop.tip}</p>
+                  <small>{getDirectionText(userLocation || stop, stop)} • {stop.walkMinutes} min walk</small>
                 </article>
-                <article>
-                  <span>AI Confidence</span>
-                  <strong>{nexusAiConfidence}%</strong>
-                </article>
-                <article>
-                  <span>Your Speed</span>
-                  <strong>{userSpeedKmph.toFixed(1)} km/h</strong>
-                </article>
-                <article>
-                  <span>Nearest Stop</span>
-                  <strong>{nearestStopFromUser ? nearestStopFromUser.name : "Locating"}</strong>
-                </article>
-              </div>
-              <p className="tracker-line">
-                <strong>Tracker:</strong> {nearestStopFromUser ? `${guidanceDirection} • ${(nearestStopFromUser.distance * 1000).toFixed(0)} m` : "Enable location permission"}
-              </p>
-              <div className="route-strip">
-                <span>Shortest: {tripDistanceKm > 0 ? `${tripDistanceKm.toFixed(2)} km` : "N/A"}</span>
-                <span>Fastest: {tripFastestMin > 0 ? `${tripFastestMin.toFixed(1)} min` : "N/A"}</span>
-              </div>
+              ))}
             </div>
           </div>
 
@@ -1289,40 +1510,24 @@ function TrackingView({ currentTime }) {
               <h4>{firstArrivingBus ? `${firstArrivingBus.line} - Express` : "No Bus"}</h4>
               <p>{firstArrivingBus ? firstArrivingBus.road : "No active corridor"}</p>
               {firstArrivingBus && (
-                <p className="nexus-ai-score">NEXUS AI SCORE: {firstArrivingBus.nexusScore}/100 • Fastest + best seats</p>
-              )}
-              {smartStopAssistant && (
-                <div className="smart-stop-highlight">
-                  <h5>Smart Stop Assistant</h5>
-                  <p>{smartStopAssistant.message}</p>
-                  {guaranteedSeatBus && (
-                    <small>
-                      {guaranteedSeatBus.number} • Predicted Seats: {guaranteedSeatBus.predictedSeatsAtYourStop} • {guaranteedSeatBus.boardingAdvice}
-                    </small>
-                  )}
-                  {!guaranteedSeatBus && alternativeStopOption && (
-                    <small>
-                      Walk {alternativeStopOption.walkMeters}m to {alternativeStopOption.stopName} for ~{alternativeStopOption.seatsLikely} seats.
-                    </small>
-                  )}
-                </div>
+                <p className="nexus-ai-score">NEXUS AI SCORE: {firstArrivingBus.nexusScore}/100 • Fastest route confidence</p>
               )}
               <div className="small-tiles">
                 <span>Capacity: {firstArrivingBus ? `${firstArrivingBus.load}%` : "--"}</span>
                 <span>Distance: {tripDistanceKm.toFixed(2)} km</span>
-                <span>AI Suggestion: {firstVacantBus ? `${firstVacantBus.line} (vacant)` : "All incoming buses full"}</span>
+                <span>AI Suggestion: {firstArrivingBus ? `${firstArrivingBus.line} recommended` : "Awaiting live stream"}</span>
               </div>
             </article>
 
             <article className="glass-card map-card-right lift-card">
               <h4>Road-Level Bus Options</h4>
-              <p>Showing first arrivals, including full buses and next vacant bus.</p>
+              <p>Showing first arrivals with safety and boarding guidance.</p>
               {aiSuggestion && (
                 <div className="ai-suggestion-box">
-                  <h5>{aiSuggestion.title}</h5>
-                  <p>{aiSuggestion.recommendation}</p>
+                  <h5>{aiSuggestion.title || "Nexus Smart Stop Insight"}</h5>
+                  <p>{aiSuggestion.recommendation || aiSuggestion.message}</p>
                   <small>
-                    Condition: {aiSuggestion.routeCondition} • Confidence: {aiSuggestion.confidence}% • Stop: {aiSuggestion.nearestStopName || "N/A"}
+                    Condition: {aiSuggestion.routeCondition || "city-traffic"} • Confidence: {aiSuggestion.confidence || nexusAiConfidence}% • Stop: {aiSuggestion.nearestStopName || aiSuggestion.alternativeStop?.stopName || "N/A"}
                   </small>
                 </div>
               )}
@@ -1334,13 +1539,13 @@ function TrackingView({ currentTime }) {
                   <div key={bus.id} className="bus-row">
                     <div>
                       <strong>{bus.line}</strong>
-                      <p>{bus.eta} min | Seats: {bus.seats}</p>
-                      <p>Predicted at your stop: {bus.predictedSeatsAtYourStop} • {bus.boardingAdvice}</p>
+                      <p>{bus.eta} min | Load: {bus.load}%</p>
+                      <p>{bus.boardingAdvice} • {bus.boardingZoneHint}</p>
                       <p>{bus.womenPriority} • Safety {bus.safetyScore}/100</p>
                       <p className="nexus-ai-score">NEXUS AI SCORE: {bus.nexusScore}/100</p>
                     </div>
-                    <span className={bus.isFull ? "status-pill late" : "status-pill good"}>
-                      {bus.isFull ? "Full" : "Vacant"}
+                    <span className={bus.load >= 90 ? "status-pill late" : bus.load >= 70 ? "status-pill warn" : "status-pill good"}>
+                      {bus.load >= 90 ? "High Load" : bus.load >= 70 ? "Moderate" : "Smooth"}
                     </span>
                   </div>
                 ))}
@@ -1350,28 +1555,18 @@ function TrackingView({ currentTime }) {
 
           <div className="tracking-bottom-panels">
             <article className="glass-card booking-panel">
-              <h4>Book Your Bus</h4>
-              <p>Reserve seat based on AI-ranked route arrivals.</p>
+              <h4>Buy Your Ticket</h4>
+              <p>Buy ticket for your preferred bus. Loyalty perks are applied automatically.</p>
               <label>
                 <span>Choose Bus</span>
                 <select value={selectedBusId} onChange={(event) => setSelectedBusId(event.target.value)}>
                   <option value="">Select bus</option>
                   {rankedBuses.map((bus) => (
-                    <option key={bus.id} value={bus.id}>{bus.line} | {bus.eta} min | Seats {bus.seats}</option>
+                    <option key={bus.id} value={bus.id}>{bus.line} | {bus.eta} min | Load {bus.load}%</option>
                   ))}
                 </select>
               </label>
-              <label>
-                <span>Seats</span>
-                <input
-                  type="number"
-                  min="1"
-                  max="4"
-                  value={seatsToBook}
-                  onChange={(event) => setSeatsToBook(Math.max(1, Number(event.target.value) || 1))}
-                />
-              </label>
-              <button type="button" className="solid-btn wide" onClick={handleBook}>Book Now</button>
+              <button type="button" className="solid-btn wide" onClick={handleBook}>Buy Ticket</button>
             </article>
 
             <article className="glass-card monetization-panel">
@@ -1388,29 +1583,6 @@ function TrackingView({ currentTime }) {
               </label>
               <p className="booking-status">{bookingMessage}</p>
             </article>
-
-            <article className="glass-card notification-panel">
-              <div className="notification-head">
-                <h4>Live Notifications</h4>
-                <span>{notifications.length} Active</span>
-              </div>
-              <p>Get instant updates when your bus arrives and when seats are booked.</p>
-              <div className="notification-list">
-                {notifications.length === 0 ? (
-                  <div className="notification-item empty">No notifications yet. Track or book a bus to see live updates.</div>
-                ) : (
-                  notifications.map((item) => (
-                    <article key={item.id} className={`notification-item ${item.kind}`}>
-                      <div className="notification-top">
-                        <strong>{item.title}</strong>
-                        <small>{item.time}</small>
-                      </div>
-                      <p>{item.message}</p>
-                    </article>
-                  ))
-                )}
-              </div>
-            </article>
           </div>
         </section>
       </section>
@@ -1418,7 +1590,214 @@ function TrackingView({ currentTime }) {
   );
 }
 
-function ScheduleView({ day, setDay, onMapOpen }) {
+function ScheduleView({ day, setDay, onMapOpen, onNotify }) {
+  const [searchText, setSearchText] = useState("");
+  const [scheduleRowsLive, setScheduleRowsLive] = useState(scheduleRows);
+  const [routesCount, setRoutesCount] = useState(0);
+  const [womenFriendlyCount, setWomenFriendlyCount] = useState(0);
+  const [avgWomenSeats, setAvgWomenSeats] = useState(0);
+  const [rapidBusId, setRapidBusId] = useState("");
+  const [rapidSeatType, setRapidSeatType] = useState("general");
+  const [rapidSeats, setRapidSeats] = useState(1);
+  const [rapidPaymentMethod, setRapidPaymentMethod] = useState("UPI");
+  const [rapidWallet, setRapidWallet] = useState(1600);
+  const [rapidMessage, setRapidMessage] = useState("Rapid booking ready. Choose bus and seat type.");
+  const [isRapidWindowOpen, setIsRapidWindowOpen] = useState(false);
+  const [lastVacancyCheck, setLastVacancyCheck] = useState("Not checked");
+  const [isVacancyRefreshing, setIsVacancyRefreshing] = useState(false);
+
+  const loadScheduleData = useCallback(async () => {
+    const [routesRes, busesRes, safetyRes] = await Promise.all([
+      fetch(`${BACKEND_BASE}/api/routes`),
+      fetch(`${BACKEND_BASE}/api/buses`),
+      fetch(`${BACKEND_BASE}/api/buses/safety`)
+    ]);
+
+    if (!routesRes.ok || !busesRes.ok || !safetyRes.ok) {
+      throw new Error("Failed to fetch schedule feeds");
+    }
+
+    const routes = await routesRes.json();
+    const buses = await busesRes.json();
+    const safetyList = await safetyRes.json();
+
+    const safetyByBusId = new Map(
+      safetyList.map((item) => [Number(item.busId), item])
+    );
+
+    setRoutesCount(routes.length);
+
+    const womenFriendly = safetyList.filter((item) => Number(item.womenSeatsMarked || 0) >= 6).length;
+    setWomenFriendlyCount(womenFriendly);
+    const avgSeats = safetyList.length
+      ? Math.round(safetyList.reduce((sum, item) => sum + Number(item.womenSeatsMarked || 0), 0) / safetyList.length)
+      : 0;
+    setAvgWomenSeats(avgSeats);
+
+    const rows = buses.map((bus, idx) => {
+      const route = routes.find((r) => Number(r.id) === Number(bus.routeId));
+      const safety = safetyByBusId.get(Number(bus.id));
+      const capacity = Math.max(1, Number(bus.capacity || 40));
+      const seatsLeft = Math.max(0, capacity - Number(bus.occupied || 0));
+      const load = Math.min(100, Math.round((Number(bus.occupied || 0) / capacity) * 100));
+      const etaMinutes = Math.max(1, Math.round(3 + ((Number(bus.currentIndex || 0) + Number(bus.progress || 0)) * 4) + idx % 6));
+      const hh = String(7 + Math.floor((idx % 8) / 2)).padStart(2, "0");
+      const mm = String((idx * 7) % 60).padStart(2, "0");
+
+      return {
+        id: Number(bus.id),
+        backendBusId: Number(bus.id),
+        code: `N${String(Number(bus.id)).padStart(2, "0")}`,
+        name: route?.name || bus.number || `Line ${Number(bus.routeId)}`,
+        load,
+        time: `${hh}:${mm}`,
+        status: load > 90 ? `Crowded | ETA ${etaMinutes}m` : `On Time | ETA ${etaMinutes}m`,
+        statusKind: load > 90 ? "late" : "good",
+        seatsLeft,
+        capacity,
+        womenSeats: Number(safety?.womenSeatsMarked || 0),
+        panicSupport: Boolean(safety?.panicSupport),
+        cleanlinessScore: Number(safety?.cleanlinessScore || 0),
+        driverRating: Number(safety?.driverRating || 0),
+        safetyTag: Number(safety?.womenSeatsMarked || 0) >= 6 ? "Women Priority" : "Standard"
+      };
+    });
+
+    setScheduleRowsLive(rows);
+    setRapidBusId((current) => {
+      if (current && rows.some((item) => String(item.backendBusId) === String(current))) {
+        return current;
+      }
+      return rows.length ? String(rows[0].backendBusId) : "";
+    });
+    setLastVacancyCheck(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+  }, []);
+
+  useEffect(() => {
+    const bootstrap = async () => {
+      try {
+        await loadScheduleData();
+      } catch (error) {
+        setRapidMessage(`Live schedule fallback in use: ${error.message}`);
+      }
+    };
+
+    bootstrap();
+  }, [loadScheduleData]);
+
+  const filteredRows = useMemo(() => {
+    const query = searchText.trim().toLowerCase();
+    if (!query) return scheduleRowsLive;
+    return scheduleRowsLive.filter((item) =>
+      item.name.toLowerCase().includes(query)
+      || item.code.toLowerCase().includes(query)
+      || item.status.toLowerCase().includes(query)
+    );
+  }, [scheduleRowsLive, searchText]);
+
+  const selectedRapidBus = scheduleRowsLive.find((item) => String(item.backendBusId) === String(rapidBusId));
+  const womenSeatVacancy = selectedRapidBus ? Math.min(selectedRapidBus.seatsLeft, selectedRapidBus.womenSeats) : 0;
+  const liveVacancyRatio = selectedRapidBus ? Math.round((selectedRapidBus.seatsLeft / Math.max(1, selectedRapidBus.capacity || 1)) * 100) : 0;
+  const availabilityStatus = !selectedRapidBus
+    ? "No Bus Selected"
+    : selectedRapidBus.seatsLeft === 0
+      ? "Sold Out"
+      : selectedRapidBus.seatsLeft <= 5
+        ? "Filling Fast"
+        : "Available";
+  const seatTypeMultiplier = rapidSeatType === "women_priority" ? 1.2 : rapidSeatType === "elderly_priority" ? 1.15 : rapidSeatType === "window" ? 1.08 : 1.0;
+  const rapidFare = selectedRapidBus ? Math.round((18 + selectedRapidBus.load * 0.1) * seatTypeMultiplier * rapidSeats) : 0;
+
+  const handleLiveVacancyCheck = async () => {
+    setIsVacancyRefreshing(true);
+    try {
+      await loadScheduleData();
+      if (selectedRapidBus) {
+        setRapidMessage(`Live vacancy refreshed for ${selectedRapidBus.code}.`);
+      } else {
+        setRapidMessage("Live vacancy refreshed.");
+      }
+    } catch (error) {
+      setRapidMessage(`Vacancy refresh failed: ${error.message}`);
+    } finally {
+      setIsVacancyRefreshing(false);
+    }
+  };
+
+  const handleRapidBooking = async () => {
+    if (!selectedRapidBus) {
+      setRapidMessage("Select a live bus for rapid booking.");
+      return;
+    }
+
+    if (selectedRapidBus.seatsLeft < rapidSeats) {
+      setRapidMessage(`Only ${selectedRapidBus.seatsLeft} seats left on this bus.`);
+      return;
+    }
+
+    if (rapidWallet < rapidFare) {
+      setRapidMessage(`Insufficient wallet balance. Need Rs ${rapidFare}.`);
+      return;
+    }
+
+    try {
+      const holdRes = await fetch(`${BACKEND_BASE}/api/book`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ busId: selectedRapidBus.backendBusId, seats: rapidSeats })
+      });
+      const holdPayload = await holdRes.json();
+      if (!holdRes.ok) throw new Error(holdPayload.error || "Rapid hold failed");
+
+      const paymentRes = await fetch(`${BACKEND_BASE}/api/payment/success`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bookingId: holdPayload.bookingId,
+          paymentProvider: rapidPaymentMethod,
+          transactionId: `RAPID-${Date.now()}`
+        })
+      });
+      const paymentPayload = await paymentRes.json();
+
+      if (!paymentRes.ok || paymentPayload.status !== "confirmed") {
+        throw new Error(paymentPayload.error || "Rapid confirmation failed");
+      }
+
+      setRapidWallet((prev) => prev - rapidFare);
+      setScheduleRowsLive((prevRows) => prevRows.map((row) => {
+        if (row.backendBusId !== selectedRapidBus.backendBusId) return row;
+        const nextSeatsLeft = Math.max(0, row.seatsLeft - rapidSeats);
+        const nextWomenSeats = rapidSeatType === "women_priority"
+          ? Math.max(0, row.womenSeats - rapidSeats)
+          : row.womenSeats;
+        const nextLoad = Math.min(100, Math.round(((row.capacity - nextSeatsLeft) / Math.max(1, row.capacity)) * 100));
+        return {
+          ...row,
+          seatsLeft: nextSeatsLeft,
+          womenSeats: nextWomenSeats,
+          load: nextLoad,
+          status: nextLoad > 90 ? row.status.replace("On Time", "Crowded") : row.status
+        };
+      }));
+      const projectedSeatsLeft = Math.max(0, selectedRapidBus.seatsLeft - rapidSeats);
+      const projectedWomenVacancy = rapidSeatType === "women_priority"
+        ? Math.max(0, womenSeatVacancy - rapidSeats)
+        : womenSeatVacancy;
+      setRapidMessage(`Rapid booking confirmed. Ticket ${paymentPayload.ticket.ticketId} issued. Live seats now ${projectedSeatsLeft}. Women seats now ${projectedWomenVacancy}.`);
+      onNotify?.(
+        "Rapid Booking Confirmed",
+        `Ticket ${paymentPayload.ticket.ticketId} confirmed with ${rapidSeatType.replace("_", " ")} seating.`,
+        "success",
+        "bookingConfirmed"
+      );
+      await loadScheduleData();
+    } catch (error) {
+      setRapidMessage(`Rapid booking failed: ${error.message}`);
+      onNotify?.("Rapid Booking Failed", error.message, "danger", "bookingConfirmed");
+    }
+  };
+
   return (
     <section className="view-wrap fade-in">
       <section className="schedule-layout">
@@ -1433,7 +1812,12 @@ function ScheduleView({ day, setDay, onMapOpen }) {
             <li>System Health</li>
           </ul>
 
-          <button type="button" className="solid-btn wide">Book Rapid Seat</button>
+          <article className="schedule-quick-book glass-card">
+            <h4>Book Seat</h4>
+            <p>Open quick booking window with live seat, women-seat, and payment details.</p>
+            <button type="button" className="solid-btn wide" onClick={() => setIsRapidWindowOpen(true)}>Open Booking Window</button>
+          </article>
+
         </aside>
 
         <section className="schedule-main">
@@ -1442,7 +1826,7 @@ function ScheduleView({ day, setDay, onMapOpen }) {
             <h2>
               Timetable & <span>Schedules</span>
             </h2>
-            <p>Dynamic route planning with real-time congestion mapping and precision timing.</p>
+            <p>Live JSON schedule with women safety, seating intelligence, security controls, and monetized rapid booking.</p>
           </div>
 
           <div className="day-switcher">
@@ -1459,7 +1843,12 @@ function ScheduleView({ day, setDay, onMapOpen }) {
           </div>
 
           <div className="search-line">
-            <input type="text" placeholder="Search by route name, station, or vehicle ID..." />
+            <input
+              type="text"
+              placeholder="Search by route name, station, or vehicle ID..."
+              value={searchText}
+              onChange={(event) => setSearchText(event.target.value)}
+            />
             <button type="button" className="solid-btn">Find</button>
           </div>
 
@@ -1468,14 +1857,14 @@ function ScheduleView({ day, setDay, onMapOpen }) {
               <header>
                 <div>
                   <h3>Main Terminal Hub</h3>
-                  <p>Northbound & Cross-City Services</p>
+                  <p>{routesCount} active routes | {filteredRows.length} live buses in schedule stream</p>
                 </div>
                 <span className="tag-ok">Live Updates</span>
               </header>
 
               <div className="rows-wrap">
-                {scheduleRows.map((item) => (
-                  <article className="row-item lift-card" key={item.code}>
+                {filteredRows.slice(0, 12).map((item) => (
+                  <article className="row-item lift-card" key={`${item.code}-${item.id}`}>
                     <span className="code-pill">{item.code}</span>
                     <div className="row-data">
                       <h4>{item.name}</h4>
@@ -1485,6 +1874,7 @@ function ScheduleView({ day, setDay, onMapOpen }) {
                           <div className="load-fill" style={{ width: `${item.load}%` }} />
                         </div>
                       </div>
+                      <p className="row-meta">Seats left: {item.seatsLeft} | Women seats: {item.womenSeats} | Panic support: {item.panicSupport ? "Yes" : "No"}</p>
                     </div>
                     <div className="time-col">
                       <strong>{item.time}</strong>
@@ -1496,30 +1886,95 @@ function ScheduleView({ day, setDay, onMapOpen }) {
             </article>
 
             <aside className="intensity-panel">
-              <h3>Service Intensity</h3>
+              <h3>Safety & Seating Intelligence</h3>
               <div className="int-row">
-                <p>Peak (07:00-08:30)</p>
-                <strong>Every 6m</strong>
-                <div className="int-track"><span style={{ width: "88%" }} /></div>
+                <p>Women-Friendly Fleet</p>
+                <strong>{womenFriendlyCount} buses</strong>
+                <div className="int-track"><span style={{ width: `${Math.min(100, womenFriendlyCount * 8)}%` }} /></div>
               </div>
               <div className="int-row">
-                <p>Off-Peak (10:00-15:00)</p>
-                <strong>Every 15m</strong>
-                <div className="int-track"><span style={{ width: "40%" }} /></div>
+                <p>Avg Reserved Women Seats</p>
+                <strong>{avgWomenSeats} seats</strong>
+                <div className="int-track"><span style={{ width: `${Math.min(100, avgWomenSeats * 9)}%` }} /></div>
               </div>
 
               <article className="demand-card">
-                <h4>Kinetic Demand Flow</h4>
-                <p>
-                  System is adjusting frequencies to match an unexpected passenger surge at Patia Square.
-                </p>
+                <h4>Security Options Active</h4>
+                <p>SOS trigger, panic support buses, women priority seats, elderly-priority boarding, and live issue reporting are enabled.</p>
               </article>
             </aside>
           </div>
 
-          <article className="visual-nav-banner lift-card" style={{position: 'relative', overflow: 'hidden'}}>
-            <img src="assets/visual_nav_bg.png" alt="Network map visual" style={{position:'absolute', inset:0, width:'100%', height:'100%', objectFit:'cover', zIndex: -1}} />
-            <div style={{position: 'relative', zIndex: 1}}>
+          {isRapidWindowOpen && (
+            <div className="rapid-modal-backdrop" onClick={() => setIsRapidWindowOpen(false)}>
+              <article className="rapid-modal-window demand-card" onClick={(event) => event.stopPropagation()}>
+                <div className="rapid-modal-head">
+                  <h4>Rapid Booking & Monetization</h4>
+                  <button type="button" className="text-btn" onClick={() => setIsRapidWindowOpen(false)}>Close</button>
+                </div>
+                <div className="rapid-booking-grid">
+                  <label>
+                    <span>Bus</span>
+                    <select value={rapidBusId} onChange={(event) => setRapidBusId(event.target.value)}>
+                      <option value="">Select live bus</option>
+                      {scheduleRowsLive.map((item) => (
+                        <option key={`rapid-${item.backendBusId}`} value={item.backendBusId}>
+                          {item.code} | Seats {item.seatsLeft} | {item.status}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label>
+                    <span>Seating Option</span>
+                    <select value={rapidSeatType} onChange={(event) => setRapidSeatType(event.target.value)}>
+                      <option value="general">General Seat</option>
+                      <option value="window">Window Seat</option>
+                      <option value="women_priority">Women Priority Seat</option>
+                      <option value="elderly_priority">Elderly Priority Seat</option>
+                    </select>
+                  </label>
+
+                  <label>
+                    <span>Seats</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="4"
+                      value={rapidSeats}
+                      onChange={(event) => setRapidSeats(Math.max(1, Number(event.target.value) || 1))}
+                    />
+                  </label>
+
+                  <label>
+                    <span>Payment</span>
+                    <select value={rapidPaymentMethod} onChange={(event) => setRapidPaymentMethod(event.target.value)}>
+                      <option value="UPI">UPI</option>
+                      <option value="Card">Card</option>
+                      <option value="Transit Wallet">Transit Wallet</option>
+                    </select>
+                  </label>
+                </div>
+
+                <p className="rapid-wallet">Wallet Balance: Rs {rapidWallet} | Rapid Fare: Rs {rapidFare}</p>
+                <div className="rapid-facility-strip">
+                  <span className="rapid-chip">Women Seats: {womenSeatVacancy} live</span>
+                  <span className="rapid-chip">Live Vacancy: {selectedRapidBus ? `${selectedRapidBus.seatsLeft}/${selectedRapidBus.capacity}` : "--"}</span>
+                  <span className={`rapid-chip status ${availabilityStatus === "Available" ? "ok" : availabilityStatus === "Filling Fast" ? "warn" : "danger"}`}>{availabilityStatus}</span>
+                </div>
+                <p className="rapid-vacancy-meta">Last vacancy check: {lastVacancyCheck} | Live vacancy: {liveVacancyRatio}%</p>
+                <button type="button" className="soft-btn wide" onClick={handleLiveVacancyCheck} disabled={isVacancyRefreshing}>
+                  {isVacancyRefreshing ? "Refreshing Vacancy..." : "Check Current Live Vacancy Status"}
+                </button>
+                <button type="button" className="solid-btn wide" onClick={handleRapidBooking}>Confirm Rapid Booking</button>
+                <p className="rapid-booking-status">{rapidMessage}</p>
+              </article>
+            </div>
+          )}
+
+          <article className="visual-nav-banner lift-card" style={{ position: "relative", overflow: "hidden" }}>
+            <img src="assets/visual_nav_bg.png" alt="Network map visual" style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", zIndex: -1 }} />
+            <div style={{ position: "relative", zIndex: 1 }}>
               <h3>Visual Navigator</h3>
               <p>Real-time GPS tracking for all active units across the metro grid.</p>
             </div>
