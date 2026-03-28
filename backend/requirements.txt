@@ -1,0 +1,14 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+sqlalchemy==2.0.42
+asyncpg==0.30.0
+geoalchemy2==0.18.0
+pydantic==2.11.7
+pydantic-settings==2.10.1
+python-dotenv==1.1.1
+httpx==0.28.1
+geopy==2.4.1
+redis==6.4.0
+celery==5.5.3
+razorpay==1.4.2
+python-multipart==0.0.20
