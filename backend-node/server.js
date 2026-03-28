@@ -3,6 +3,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const crypto = require('crypto');
 const data = require('./data');
 
 const app = express();
@@ -14,7 +15,7 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-const GEMMA_MODEL = process.env.GEMMA_MODEL || 'gemma2:2b';
+const GEMMA_MODEL = process.env.GEMMA_MODEL || 'gemma:3b';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/generate';
 
 let routes = JSON.parse(JSON.stringify(data.routes));
@@ -22,9 +23,11 @@ let buses = JSON.parse(JSON.stringify(data.buses));
 let smartAlerts = [];
 let waitlist = [];
 let savedCommutes = [];
+let bookingLedger = [];
 let bookingCounter = 0;
 let reportCounter = 0;
 let waitlistCounter = 0;
+const BOOKING_HOLD_MS = 5 * 60 * 1000;
 
 const calculateDistance = (p1, p2) => data.haversine(p1.lat, p1.lng, p2.lat, p2.lng);
 
@@ -210,19 +213,96 @@ const normalizeGemmaOutput = (gemmaPayload) => {
     })
     .filter(Boolean);
 
-  const fallbackBuses = safeBuses.length ? safeBuses : JSON.parse(JSON.stringify(data.buses));
+  const targetFleetSize = Math.max(24, fallbackRoutes.length * 3);
+  const fallbackBuses = ensureBusCoverage(fallbackRoutes, safeBuses, 2, targetFleetSize);
   return { routes: fallbackRoutes, buses: fallbackBuses };
+};
+
+const makeSeedBus = (route, idCounter, seed) => {
+  const routePoints = route.points || [];
+  const maxIndex = Math.max(0, routePoints.length - 2);
+  const capacity = 40;
+  const occupied = Math.max(3, Math.min(36, 8 + (seed % 27)));
+
+  return {
+    id: idCounter,
+    number: `OD 01 NX ${String(100 + idCounter).padStart(3, '0')}`,
+    routeId: route.id,
+    capacity,
+    occupied,
+    currentIndex: maxIndex ? (seed % (maxIndex + 1)) : 0,
+    progress: Number((((seed % 85) + 10) / 100).toFixed(2)),
+    speed: 24 + (seed % 18),
+    direction: seed % 3 === 0 ? -1 : 1
+  };
+};
+
+const buildFallbackFleet = (activeRoutes, targetCount = 12) => {
+  const result = [];
+  let idCounter = 1;
+
+  while (result.length < targetCount) {
+    activeRoutes.forEach((route) => {
+      if (result.length >= targetCount) return;
+      const seed = idCounter * 17;
+      result.push(makeSeedBus(route, idCounter, seed));
+      idCounter += 1;
+    });
+  }
+
+  return result;
+};
+
+const ensureBusCoverage = (activeRoutes, seededBuses, minPerRoute = 2, targetCount = 24) => {
+  if (!Array.isArray(activeRoutes) || activeRoutes.length === 0) return [];
+
+  const validRouteIds = new Set(activeRoutes.map((route) => route.id));
+  const result = (Array.isArray(seededBuses) ? seededBuses : [])
+    .filter((bus) => validRouteIds.has(bus.routeId))
+    .map((bus, idx) => ({ ...bus, id: idx + 1 }));
+
+  let nextId = result.length + 1;
+  const routeCounts = new Map(activeRoutes.map((route) => [route.id, 0]));
+  result.forEach((bus) => {
+    routeCounts.set(bus.routeId, (routeCounts.get(bus.routeId) || 0) + 1);
+  });
+
+  const expandedTarget = Math.max(targetCount, activeRoutes.length * minPerRoute);
+
+  const pushBusForRoute = (route, salt) => {
+    const seed = nextId * 17 + salt;
+    result.push(makeSeedBus(route, nextId, seed));
+    routeCounts.set(route.id, (routeCounts.get(route.id) || 0) + 1);
+    nextId += 1;
+  };
+
+  activeRoutes.forEach((route, idx) => {
+    while ((routeCounts.get(route.id) || 0) < minPerRoute) {
+      pushBusForRoute(route, idx * 23);
+    }
+  });
+
+  while (result.length < expandedTarget) {
+    activeRoutes.forEach((route, idx) => {
+      if (result.length >= expandedTarget) return;
+      pushBusForRoute(route, idx * 31);
+    });
+  }
+
+  return result;
 };
 
 const generateRoutesAndBusesWithGemma2B = async () => {
   const prompt = `You are a transit planner for Bhubaneswar. Generate JSON only with keys routes and buses.
 
 rules:
-- routes: 2 to 4 items
+- routes: 8 to 12 items
 - each route has: name, stopIds (existing location ids only)
+- ensure every location id appears in at least one route
 - use this location list: ${JSON.stringify(data.locations.map((loc) => ({ id: loc.id, name: loc.name })))}
-- buses: 5 to 8 items
+- buses: 24 to 40 items
 - each bus has: number, routeId (1-based route index), capacity, occupied, currentIndex, progress, speed, direction
+- ensure each route has at least 2 buses
 - direction is 1 or -1
 
 Output format:
@@ -249,7 +329,7 @@ Output format:
     console.log(`Gemma initialized routes=${routes.length}, buses=${buses.length}`);
   } catch (error) {
     routes = JSON.parse(JSON.stringify(data.routes));
-    buses = JSON.parse(JSON.stringify(data.buses));
+    buses = buildFallbackFleet(routes, Math.max(24, routes.length * 3));
     console.log(`Gemma init fallback active (${error.message})`);
   }
 };
@@ -330,6 +410,29 @@ const calcPathDistanceMeters = (pathPoints) => {
   return total;
 };
 
+const buildFastestPathVariant = (shortestPath) => {
+  if (!Array.isArray(shortestPath) || shortestPath.length < 2) return shortestPath || [];
+
+  if (shortestPath.length === 2) {
+    const [start, end] = shortestPath;
+    const mid = {
+      lat: Number((((start.lat + end.lat) / 2) + 0.0012).toFixed(6)),
+      lng: Number((((start.lng + end.lng) / 2) - 0.001).toFixed(6))
+    };
+    return [start, mid, end];
+  }
+
+  return shortestPath.map((point, index) => {
+    if (index === 0 || index === shortestPath.length - 1) return point;
+
+    const direction = index % 2 === 0 ? 1 : -1;
+    return {
+      lat: Number((point.lat + direction * 0.0014).toFixed(6)),
+      lng: Number((point.lng + direction * 0.0011).toFixed(6))
+    };
+  });
+};
+
 const summarizeAlerts = (alerts) => {
   if (!alerts.length) {
     return 'No active crowd reports. Route is operating normally.';
@@ -362,6 +465,193 @@ const buildBusSafetyMeta = (bus) => {
   };
 };
 
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const stepsBeforeStop = (totalStops, currentStopIndex, targetStopIndex, direction) => {
+  if (totalStops <= 1) return 0;
+  const current = clamp(currentStopIndex, 0, totalStops - 1);
+  const target = clamp(targetStopIndex, 0, totalStops - 1);
+
+  if (direction === -1) {
+    return target <= current
+      ? current - target
+      : current + (totalStops - 1 - target);
+  }
+
+  return target >= current
+    ? target - current
+    : (totalStops - current) + target;
+};
+
+const resolveStopIndexOnRoute = (route, stopLocation) => {
+  if (!route || !stopLocation) return 0;
+  const routeStops = Array.isArray(route.stops) ? route.stops : [];
+  if (!routeStops.length) return 0;
+
+  const exactIndex = routeStops.indexOf(stopLocation.id);
+  if (exactIndex >= 0) return exactIndex;
+
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  routeStops.forEach((stopId, idx) => {
+    const stopLoc = locationById(stopId);
+    if (!stopLoc) return;
+    const d = calculateDistance(stopLoc, stopLocation);
+    if (d < bestDistance) {
+      bestDistance = d;
+      bestIndex = idx;
+    }
+  });
+  return bestIndex;
+};
+
+const predictSeatsAtStop = (bus, route, stopLocation) => {
+  const currentSeatsLeft = Math.max(0, bus.capacity - bus.occupied);
+  if (!route || !stopLocation) {
+    return {
+      currentSeatsLeft,
+      predictedSeatsAtYourStop: currentSeatsLeft,
+      boardingAdvice: 'Stand near MIDDLE door',
+      boardingZoneHint: 'Middle door, 10m ahead',
+      boardingOffsetMeters: 10,
+      safetyScore: 72,
+      isWomenFriendly: bus.id % 2 === 0,
+      womenPriority: bus.id % 2 === 0 ? 'Women & Elderly Priority Bus' : 'Standard Bus',
+      predictedOccupancyAtYourStop: bus.occupied
+    };
+  }
+
+  const routeStops = Array.isArray(route.stops) && route.stops.length ? route.stops : [stopLocation.id];
+  const totalStops = routeStops.length;
+  const userStopIndex = resolveStopIndexOnRoute(route, stopLocation);
+  const currentStopIndex = clamp(Math.round(bus.currentIndex), 0, Math.max(0, totalStops - 1));
+  const stopsBeforeUser = stepsBeforeStop(totalStops, currentStopIndex, userStopIndex, bus.direction === -1 ? -1 : 1);
+
+  const timeWindow = getTimeWindowFactor();
+  const peakMultiplier = timeWindow.label === 'Peak' ? 1.2 : timeWindow.label === 'Midday' ? 1.08 : 1.0;
+  let simulatedOccupancy = clamp(Math.round(bus.occupied), 0, bus.capacity);
+
+  for (let hop = 0; hop < stopsBeforeUser; hop += 1) {
+    const idx = bus.direction === -1
+      ? (currentStopIndex - (hop + 1) + totalStops) % totalStops
+      : (currentStopIndex + hop + 1) % totalStops;
+    const stopMeta = locationById(routeStops[idx]);
+    const isMajorHub = stopMeta?.type === 'major_hub';
+    const seed = (bus.id * 29 + idx * 11 + stopLocation.id * 7 + hop * 13) % 100;
+
+    const alightRate = (0.08 + (seed % 16) / 220) * (isMajorHub ? 1.38 : 1.0);
+    const boardRate = (0.05 + ((seed + 9) % 18) / 240) * peakMultiplier * (isMajorHub ? 1.2 : 1.0);
+
+    simulatedOccupancy = clamp(
+      Math.round(simulatedOccupancy - (bus.capacity * alightRate) + (bus.capacity * boardRate)),
+      0,
+      bus.capacity
+    );
+  }
+
+  const predictedSeatsAtYourStop = clamp(bus.capacity - simulatedOccupancy, 0, bus.capacity);
+  const crowdRatio = simulatedOccupancy / Math.max(1, bus.capacity);
+  const safetyBaseline = bus.id % 2 === 0 ? 90 : 76;
+  const safetyScore = clamp(Math.round(safetyBaseline - (crowdRatio * 32)), 52, 98);
+  const isWomenFriendly = safetyScore >= 84 || bus.id % 2 === 0;
+
+  const boardingAdvice = predictedSeatsAtYourStop >= 10
+    ? 'Stand near FRONT door'
+    : predictedSeatsAtYourStop >= 5
+      ? 'Stand near MIDDLE door'
+      : predictedSeatsAtYourStop > 0
+        ? 'Stand near REAR door and board quickly'
+        : 'Bus may be full - consider next bus or alternate stop';
+
+  const boardingZoneHint = predictedSeatsAtYourStop >= 10
+    ? 'Front door, 30m ahead'
+    : predictedSeatsAtYourStop >= 5
+      ? 'Middle door, 10m ahead'
+      : predictedSeatsAtYourStop > 0
+        ? 'Rear door, 12m behind'
+        : 'Avoid crowd gate, wait near stop marker';
+
+  const boardingOffsetMeters = predictedSeatsAtYourStop >= 10
+    ? 30
+    : predictedSeatsAtYourStop >= 5
+      ? 10
+      : predictedSeatsAtYourStop > 0
+        ? -12
+        : 0;
+
+  return {
+    currentSeatsLeft,
+    predictedSeatsAtYourStop,
+    boardingAdvice,
+    boardingZoneHint,
+    boardingOffsetMeters,
+    safetyScore,
+    isWomenFriendly,
+    womenPriority: isWomenFriendly ? 'Women & Elderly Priority Bus' : 'Standard Bus',
+    predictedOccupancyAtYourStop: simulatedOccupancy
+  };
+};
+
+const suggestAlternativeStopForSeats = (from, to, liveBuses) => {
+  let best = null;
+
+  data.locations.forEach((candidate) => {
+    if (candidate.id === from.id || candidate.id === to.id) return;
+
+    const walkMeters = Math.round(calculateDistance(from, candidate));
+    if (walkMeters < 120 || walkMeters > 1200) return;
+
+    let bestPredictedSeats = -1;
+    let bestEta = Number.POSITIVE_INFINITY;
+    let bestBusNumber = null;
+
+    liveBuses.forEach((bus) => {
+      const route = routes.find((r) => r.id === bus.routeId);
+      if (!route) return;
+
+      const seatPrediction = predictSeatsAtStop(bus, route, candidate);
+      const etaToCandidate = calculateETA(bus, candidate.lat, candidate.lng);
+
+      if (
+        seatPrediction.predictedSeatsAtYourStop > bestPredictedSeats
+        || (
+          seatPrediction.predictedSeatsAtYourStop === bestPredictedSeats
+          && etaToCandidate < bestEta
+        )
+      ) {
+        bestPredictedSeats = seatPrediction.predictedSeatsAtYourStop;
+        bestEta = etaToCandidate;
+        bestBusNumber = bus.number;
+      }
+    });
+
+    if (bestPredictedSeats < 6) return;
+
+    const score = (bestPredictedSeats * 6) - (walkMeters / 70) - (bestEta * 0.9);
+    if (!best || score > best.score) {
+      best = {
+        stopId: candidate.id,
+        stopName: candidate.name,
+        walkMeters,
+        bestPredictedSeats,
+        bestBusEtaMinutes: Math.round(bestEta),
+        bestBusNumber,
+        score
+      };
+    }
+  });
+
+  if (!best) return null;
+  return {
+    stopId: best.stopId,
+    stopName: best.stopName,
+    walkMeters: best.walkMeters,
+    seatsLikely: best.bestPredictedSeats,
+    busEtaMinutes: best.bestBusEtaMinutes,
+    busNumber: best.bestBusNumber
+  };
+};
+
 const buildMultimodalComparison = (distanceMeters, bestBusEta) => {
   const km = distanceMeters / 1000;
   const busMinutes = Math.max(1, Math.round(bestBusEta));
@@ -383,10 +673,110 @@ const buildMultimodalComparison = (distanceMeters, bestBusEta) => {
   return { options, cheapest: cheapest.mode, fastest: fastest.mode };
 };
 
+const nowMs = () => Date.now();
+
+const makeId = (prefix) => `${prefix}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+
+const isPendingActive = (booking) => booking.status === 'pending' && booking.expiresAtMs > nowMs();
+
+const seatsOnHoldForBus = (busId) => bookingLedger
+  .filter((booking) => booking.busId === busId && isPendingActive(booking))
+  .reduce((sum, booking) => sum + booking.seats, 0);
+
+const seatsAvailableForBus = (bus) => Math.max(0, bus.capacity - bus.occupied - seatsOnHoldForBus(bus.id));
+
+const bookingPublicView = (booking) => ({
+  bookingId: booking.bookingId,
+  busId: booking.busId,
+  seats: booking.seats,
+  amount: booking.amount,
+  reservationFee: booking.reservationFee,
+  status: booking.status,
+  paymentStatus: booking.paymentStatus,
+  paymentProvider: booking.paymentProvider,
+  transactionId: booking.transactionId || null,
+  createdAt: booking.createdAt,
+  expiresAt: booking.expiresAt,
+  confirmedAt: booking.confirmedAt || null,
+  failedAt: booking.failedAt || null,
+  failureReason: booking.failureReason || null
+});
+
+const nearestLocationToPoint = (point) => {
+  if (!point || typeof point.lat !== 'number' || typeof point.lng !== 'number') return null;
+  let nearest = null;
+  let best = Number.POSITIVE_INFINITY;
+  data.locations.forEach((loc) => {
+    const d = calculateDistance(point, loc);
+    if (d < best) {
+      best = d;
+      nearest = loc;
+    }
+  });
+  if (!nearest) return null;
+  return { ...nearest, distanceMeters: Math.round(best) };
+};
+
+const buildAiSuggestion = ({ from, to, userPoint, userSpeedKmph, rankedBuses, trafficWindow, alerts }) => {
+  const topBus = rankedBuses.find((bus) => bus.seatsLeft > 0) || rankedBuses[0] || null;
+  const nearestStop = nearestLocationToPoint(userPoint);
+  const severeAlerts = alerts.filter((alert) => alert.severity >= 4).length;
+  const routeCondition = severeAlerts > 0 ? 'heavy_disruption' : trafficWindow === 'Peak' ? 'moderate_traffic' : 'smooth';
+
+  if (!topBus) {
+    return {
+      title: 'No active buses found',
+      recommendation: `Use alternate mode from ${from.name} to ${to.name} for now.`,
+      recommendedBusId: null,
+      recommendedBusNumber: null,
+      nearestStopName: nearestStop ? nearestStop.name : null,
+      nearestStopDistanceMeters: nearestStop ? nearestStop.distanceMeters : null,
+      userSpeedKmph,
+      routeCondition,
+      confidence: 52,
+      factors: {
+        userLocationUsed: Boolean(userPoint),
+        userSpeedUsed: typeof userSpeedKmph === 'number',
+        trafficWindow,
+        vacancyConsidered: false,
+        alertCount: alerts.length
+      }
+    };
+  }
+
+  const walkingMinutes = nearestStop ? Math.max(1, Math.round((nearestStop.distanceMeters / 80) / Math.max(0.8, userSpeedKmph / 5))) : 0;
+  const waitMinutes = topBus.etaMinutes;
+  const crowdAdvice = topBus.seatsLeft <= 5 ? 'Bus almost full, board quickly.' : 'Seats available comfortably.';
+  const confidenceBase = topBus.confidencePercent || 70;
+  const confidence = Math.max(45, Math.min(98, confidenceBase - severeAlerts * 8 + (topBus.seatsLeft > 0 ? 6 : -10)));
+
+  return {
+    title: 'Nexus AI Trip Suggestion',
+    recommendation: `Walk ${walkingMinutes} min to ${nearestStop ? nearestStop.name : from.name}, take ${topBus.number} in ~${waitMinutes} min. ${crowdAdvice}`,
+    recommendedBusId: topBus.busId,
+    recommendedBusNumber: topBus.number,
+    nearestStopName: nearestStop ? nearestStop.name : null,
+    nearestStopDistanceMeters: nearestStop ? nearestStop.distanceMeters : null,
+    userSpeedKmph,
+    routeCondition,
+    confidence,
+    factors: {
+      userLocationUsed: Boolean(userPoint),
+      userSpeedUsed: typeof userSpeedKmph === 'number',
+      trafficWindow,
+      vacancyConsidered: true,
+      alertCount: alerts.length
+    }
+  };
+};
+
 setInterval(() => {
   buses.forEach((bus) => {
     const route = routes.find((r) => r.id === bus.routeId);
     if (!route || route.points.length < 2) return;
+
+    // Add slight random speed variation for more realistic live movement.
+    bus.speed = Math.max(18, 30 + Math.random() * 15);
 
     bus.progress += bus.speed / 1200;
 
@@ -424,6 +814,14 @@ app.get('/api/locations', (req, res) => res.json(data.locations));
 app.get('/api/routes', (req, res) => res.json(routes));
 app.get('/api/buses', (req, res) => res.json(buses));
 
+app.get('/api/booking/:bookingId', (req, res) => {
+  const booking = bookingLedger.find((item) => item.bookingId === req.params.bookingId);
+  if (!booking) {
+    return res.status(404).json({ error: 'Booking not found' });
+  }
+  return res.json(bookingPublicView(booking));
+});
+
 app.get('/api/buses/safety', (req, res) => {
   const payload = buses.map((bus) => ({
     busId: bus.id,
@@ -439,7 +837,7 @@ app.post('/api/gemma/regenerate', async (req, res) => {
 });
 
 app.post('/api/plan-trip', (req, res) => {
-  const { fromId, toId } = req.body;
+  const { fromId, toId, userLat, userLng, userSpeedKmph } = req.body;
   const from = data.locations.find((l) => l.id === Number(fromId));
   const to = data.locations.find((l) => l.id === Number(toId));
 
@@ -464,6 +862,9 @@ app.post('/api/plan-trip', (req, res) => {
       const position = currentBusPosition(bus, route);
       const distanceToShortestPath = distancePointToPolylineMeters(position, pathPoints);
       const predictive = calculatePredictiveEtaMeta(bus, from, distanceToShortestPath);
+      const seatPrediction = predictSeatsAtStop(bus, route, from);
+      const seatsLeft = seatPrediction.currentSeatsLeft;
+      const crowdLevel = bus.occupied / Math.max(1, bus.capacity);
       return {
         busId: bus.id,
         number: bus.number,
@@ -474,15 +875,33 @@ app.post('/api/plan-trip', (req, res) => {
         crowdLevel: predictive.crowdLevel,
         likelyCrowdedAtArrival: predictive.likelyCrowdedAtArrival,
         trafficWindow: predictive.trafficWindow,
-        seatsLeft: bus.capacity - bus.occupied,
-        status: bus.capacity - bus.occupied > 0 ? 'Available' : 'Full (next bus coming)',
+        nexusScore: Math.max(20, Math.round(100 - ((bus.occupied / bus.capacity) * 70) - Math.min(25, distanceToShortestPath / 80))),
+        nexusAIScore: Math.max(70, Math.round(98 - (crowdLevel * 45) + (predictive.predictedEtaMinutes < 6 ? 12 : 0))),
+        crowdPrediction: crowdLevel > 0.75 ? 'Likely crowded at KIIT/Rasulgarh' : crowdLevel > 0.5 ? 'Moderate crowd expected' : 'Good seats likely',
+        delayProbability: predictive.predictedEtaMinutes > 10 ? 'High delay risk (peak traffic)' : 'Low delay risk',
+        currentSeatsLeft: seatPrediction.currentSeatsLeft,
+        predictedSeatsAtYourStop: seatPrediction.predictedSeatsAtYourStop,
+        predictedOccupancyAtYourStop: seatPrediction.predictedOccupancyAtYourStop,
+        boardingAdvice: seatPrediction.boardingAdvice,
+        boardingZoneHint: seatPrediction.boardingZoneHint,
+        boardingOffsetMeters: seatPrediction.boardingOffsetMeters,
+        safetyScore: seatPrediction.safetyScore,
+        isWomenFriendly: seatPrediction.isWomenFriendly,
+        womenPriority: seatPrediction.womenPriority,
+        seatsLeft,
+        status: seatsLeft > 8 ? 'Vacant' : seatsLeft > 0 ? 'Filling Fast' : 'Full',
         distanceToPathMeters: Math.round(distanceToShortestPath),
         safety: buildBusSafetyMeta(bus)
       };
     })
     .filter(Boolean)
     .filter((bus) => bus.distanceToPathMeters <= corridorThresholdMeters)
-    .sort((a, b) => (a.etaMinutes - b.etaMinutes) || (a.distanceToPathMeters - b.distanceToPathMeters));
+    .sort((a, b) => {
+      if (a.isWomenFriendly !== b.isWomenFriendly) return b.isWomenFriendly ? 1 : -1;
+      return (b.predictedSeatsAtYourStop - a.predictedSeatsAtYourStop)
+        || (a.etaMinutes - b.etaMinutes)
+        || (a.distanceToPathMeters - b.distanceToPathMeters);
+    });
 
   const fallbackBuses = busOptions.length
     ? busOptions
@@ -493,28 +912,62 @@ app.post('/api/plan-trip', (req, res) => {
           number: bus.number,
           routeId: bus.routeId,
           etaMinutes: calculateETA(bus, from.lat, from.lng),
-          seatsLeft: bus.capacity - bus.occupied,
-          status: bus.capacity - bus.occupied > 0 ? 'Available' : 'Full (next bus coming)',
+          nexusScore: Math.max(20, Math.round(100 - ((bus.occupied / bus.capacity) * 70))),
+          nexusAIScore: Math.max(70, Math.round(98 - ((bus.occupied / Math.max(1, bus.capacity)) * 45))),
+          crowdPrediction: (bus.occupied / Math.max(1, bus.capacity)) > 0.75 ? 'Likely crowded at KIIT/Rasulgarh' : (bus.occupied / Math.max(1, bus.capacity)) > 0.5 ? 'Moderate crowd expected' : 'Good seats likely',
+          delayProbability: calculateETA(bus, from.lat, from.lng) > 10 ? 'High delay risk (peak traffic)' : 'Low delay risk',
+          ...(() => {
+            const route = routes.find((r) => r.id === bus.routeId);
+            return predictSeatsAtStop(bus, route, from);
+          })(),
+          seatsLeft: Math.max(0, bus.capacity - bus.occupied),
+          status: (bus.capacity - bus.occupied) > 8 ? 'Vacant' : (bus.capacity - bus.occupied) > 0 ? 'Filling Fast' : 'Full',
           distanceToPathMeters: -1,
           safety: buildBusSafetyMeta(bus)
         }))
-        .sort((a, b) => a.etaMinutes - b.etaMinutes);
+        .sort((a, b) => {
+          if (a.isWomenFriendly !== b.isWomenFriendly) return b.isWomenFriendly ? 1 : -1;
+          return (b.predictedSeatsAtYourStop - a.predictedSeatsAtYourStop) || (a.etaMinutes - b.etaMinutes);
+        });
 
   const nextThree = fallbackBuses.slice(0, 3);
   const nextAvailable = fallbackBuses.find((bus) => bus.seatsLeft > 0) || null;
+  const nextGuaranteedSeatBus = fallbackBuses.find((bus) => bus.predictedSeatsAtYourStop >= 6) || null;
+  const alternativeStopOption = nextGuaranteedSeatBus ? null : suggestAlternativeStopForSeats(from, to, buses);
   const pathDistanceMeters = calcPathDistanceMeters(pathPoints);
   const activeRouteAlerts = smartAlerts.filter(
     (alert) => alert.routeId === null || fallbackBuses.some((bus) => bus.routeId === alert.routeId)
   );
 
   const modal = buildMultimodalComparison(pathDistanceMeters, nextThree[0] ? nextThree[0].etaMinutes : 12);
+  const fastestPath = buildFastestPathVariant(pathPoints);
+  const fastestTimeMin = nextThree[0] ? nextThree[0].etaMinutes : Math.max(2, Math.round((pathDistanceMeters / 1000) * 2.8));
+  const userPoint = (typeof userLat === 'number' && typeof userLng === 'number') ? { lat: userLat, lng: userLng } : null;
+  const trafficWindow = nextThree[0]?.trafficWindow || getTimeWindowFactor().label;
+  const aiSuggestion = buildAiSuggestion({
+    from,
+    to,
+    userPoint,
+    userSpeedKmph: typeof userSpeedKmph === 'number' ? userSpeedKmph : 4.5,
+    rankedBuses: fallbackBuses,
+    trafficWindow,
+    alerts: activeRouteAlerts
+  });
 
   return res.json({
-    routeName: `Shortest corridor: ${from.name} -> ${to.name}`,
+    routeName: `Smart Corridor: ${from.name} -> ${to.name}`,
     path: pathPoints,
+    shortestPath: pathPoints,
+    fastestPath,
     pathLocationIds: shortest.path,
     shortestDistanceMeters: Math.round(shortest.distanceMeters),
     shortestDistanceKm: Number((pathDistanceMeters / 1000).toFixed(2)),
+    distanceKm: Number((pathDistanceMeters / 1000).toFixed(2)),
+    fastestTimeMin,
+    nexusConfidence: Math.max(60, Math.round((nextThree.reduce((sum, bus) => sum + (bus.confidencePercent || 70), 0) / Math.max(1, nextThree.length)) || 72)),
+    aiInsight: nextThree[0]
+      ? `Nexus AI recommends ${nextThree[0].number} - best speed + seats balance right now.`
+      : 'Nexus AI suggests waiting for the next active vehicle on this corridor.',
     buses: fallbackBuses,
     nextThreeBuses: nextThree,
     seatSummary: {
@@ -525,9 +978,42 @@ app.post('/api/plan-trip', (req, res) => {
     alerts: activeRouteAlerts,
     aiAlertSummary: summarizeAlerts(activeRouteAlerts),
     multimodalComparison: modal,
+    aiSuggestion,
+    smartStopAssistant: nextGuaranteedSeatBus
+      ? {
+          status: 'guaranteed-seat-bus',
+          message: `Next bus with strong seat chance: ${nextGuaranteedSeatBus.number} in ~${nextGuaranteedSeatBus.etaMinutes} min`,
+          recommendedBusId: nextGuaranteedSeatBus.busId,
+          recommendedBusNumber: nextGuaranteedSeatBus.number,
+          predictedSeatsAtYourStop: nextGuaranteedSeatBus.predictedSeatsAtYourStop,
+          boardingAdvice: nextGuaranteedSeatBus.boardingAdvice,
+          boardingZoneHint: nextGuaranteedSeatBus.boardingZoneHint
+        }
+      : alternativeStopOption
+        ? {
+            status: 'walk-alternative-stop',
+            message: `Walk ${alternativeStopOption.walkMeters}m to ${alternativeStopOption.stopName} for better seat chance`,
+            alternativeStop: alternativeStopOption
+          }
+        : {
+            status: 'wait-next-cycle',
+            message: 'All buses likely full at your stop right now. Next refresh may unlock seats.'
+          },
+    guaranteedSeatBus: nextGuaranteedSeatBus
+      ? {
+          busId: nextGuaranteedSeatBus.busId,
+          number: nextGuaranteedSeatBus.number,
+          etaMinutes: nextGuaranteedSeatBus.etaMinutes,
+          predictedSeatsAtYourStop: nextGuaranteedSeatBus.predictedSeatsAtYourStop,
+          boardingAdvice: nextGuaranteedSeatBus.boardingAdvice,
+          safetyScore: nextGuaranteedSeatBus.safetyScore
+        }
+      : null,
+    alternativeStopOption,
+    nexusAiConfidence: Math.max(55, Math.round((nextThree.reduce((sum, bus) => sum + (bus.confidencePercent || 70), 0) / Math.max(1, nextThree.length)) || 72)),
     message: busOptions.length
-      ? 'Showing buses near the shortest route (Gemma + live simulation)'
-      : 'No buses near shortest route right now, showing nearest upcoming buses instead'
+      ? 'Nexus AI selected the smartest route for you'
+      : 'No buses near shortest route now, showing nearest upcoming buses instead'
   });
 });
 
@@ -561,6 +1047,53 @@ app.post('/api/alerts/report', (req, res) => {
 
   io.emit('alert-update', report);
   return res.json({ status: 'accepted', report, aiSummary: summarizeAlerts(smartAlerts) });
+});
+
+// Compatibility endpoint requested for hackathon demos.
+app.post('/api/report-alert', (req, res) => {
+  const { busId, type, message, lat, lng } = req.body || {};
+  const payload = {
+    busId: busId || 'All',
+    type: type || 'general',
+    message: message || 'User reported issue on this route',
+    timestamp: new Date().toLocaleTimeString('en-IN'),
+    location: {
+      lat: typeof lat === 'number' ? lat : 20.27,
+      lng: typeof lng === 'number' ? lng : 85.82
+    }
+  };
+
+  io.emit('new-alert', payload);
+
+  smartAlerts.unshift({
+    id: `ALR-${Date.now()}-${++reportCounter}`,
+    routeId: null,
+    busId: Number.isFinite(Number(busId)) ? Number(busId) : null,
+    type: payload.type,
+    severity: 3,
+    message: payload.message,
+    userId: 'community',
+    createdAt: new Date().toISOString()
+  });
+  smartAlerts = smartAlerts.slice(0, 120);
+
+  return res.json({ success: true, message: 'Alert broadcast to community', payload });
+});
+
+app.post('/api/report-boarding-issue', (req, res) => {
+  const { busId, issue } = req.body || {};
+  const normalizedIssue = ['full', 'stopped_far', 'rash_driving', 'harassment', 'door_not_opened'].includes(issue)
+    ? issue
+    : 'full';
+  const safetyPayload = {
+    busId: Number.isFinite(Number(busId)) ? Number(busId) : 'All',
+    issue: normalizedIssue,
+    message: `SAFETY ALERT: ${normalizedIssue.toUpperCase()} reported on bus ${busId || 'All'}`,
+    timestamp: new Date().toISOString()
+  };
+
+  io.emit('safety-alert', safetyPayload);
+  return res.json({ success: true, payload: safetyPayload });
 });
 
 app.post('/api/waitlist', (req, res) => {
@@ -639,36 +1172,168 @@ app.post('/api/book', (req, res) => {
   const { busId, seats } = req.body;
   const parsedSeats = Number(seats) || 0;
   const bus = buses.find((b) => b.id === Number(busId));
+  const availableSeats = bus ? seatsAvailableForBus(bus) : 0;
 
-  if (!bus || parsedSeats <= 0 || bus.capacity - bus.occupied < parsedSeats) {
+  if (!bus || parsedSeats <= 0 || availableSeats < parsedSeats) {
     return res.status(400).json({ error: 'Not enough seats' });
   }
 
-  bus.occupied += parsedSeats;
   bookingCounter += 1;
   const isFreeSeatWave = bookingCounter <= 50;
   const reservationFee = isFreeSeatWave ? 0 : parsedSeats * 2;
   const totalAmount = parsedSeats * 15 + reservationFee;
+  const bookingId = makeId('BK');
+  const createdAtMs = nowMs();
+  const expiresAtMs = createdAtMs + BOOKING_HOLD_MS;
+  const razorpayOrderId = makeId('order');
+
+  const booking = {
+    bookingId,
+    busId: bus.id,
+    seats: parsedSeats,
+    amount: totalAmount,
+    reservationFee,
+    status: 'pending',
+    paymentStatus: 'awaiting_payment',
+    paymentProvider: null,
+    transactionId: null,
+    freeSeatWaveApplied: isFreeSeatWave,
+    createdAtMs,
+    expiresAtMs,
+    createdAt: new Date(createdAtMs).toISOString(),
+    expiresAt: new Date(expiresAtMs).toISOString(),
+    confirmedAt: null,
+    failedAt: null,
+    failureReason: null,
+    razorpayOrderId
+  };
+
+  bookingLedger.unshift(booking);
+  bookingLedger = bookingLedger.slice(0, 2000);
 
   return res.json({
-    bookingId: `BK${Date.now()}-${bookingCounter}`,
+    bookingId,
     status: 'pending',
     amount: totalAmount,
     reservationFee,
     freeSeatWaveApplied: isFreeSeatWave,
+    expiresAt: booking.expiresAt,
+    holdWindowSeconds: Math.floor(BOOKING_HOLD_MS / 1000),
+    seatsHeld: parsedSeats,
+    seatsRemainingAfterHold: availableSeats - parsedSeats,
     paymentOptions: [
       {
         provider: 'razorpay',
-        note: 'Cards / UPI / Wallets'
+        note: 'Cards / UPI / Wallets',
+        razorpayOrderId,
+        keyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder'
       },
       {
         provider: 'free-upi',
         note: 'ZERO platform fee via direct UPI (Paytm/PhonePe)',
-        qrCode: 'https://fake-qr.example.com/freeupi'
+        qrCode: 'https://fake-qr.example.com/freeupi',
+        upiIntent: 'upi://pay?pa=nexustransit@upi&pn=Nexus%20Transit&cu=INR'
       }
     ]
   });
 });
+
+app.post('/api/payment/success', (req, res) => {
+  const { bookingId, paymentProvider, transactionId } = req.body;
+  const booking = bookingLedger.find((item) => item.bookingId === bookingId);
+  if (!booking) {
+    return res.status(404).json({ error: 'Booking not found' });
+  }
+
+  if (!isPendingActive(booking)) {
+    booking.status = 'expired';
+    booking.paymentStatus = 'not_collected';
+    booking.failureReason = 'Booking hold expired';
+    return res.status(400).json({ error: 'Booking hold expired. Please book again.' });
+  }
+
+  if (booking.status === 'confirmed') {
+    return res.json({ status: 'already_confirmed', booking: bookingPublicView(booking) });
+  }
+
+  const bus = buses.find((item) => item.id === booking.busId);
+  if (!bus) {
+    return res.status(400).json({ error: 'Bus not found for booking' });
+  }
+
+  bus.occupied = Math.min(bus.capacity, bus.occupied + booking.seats);
+  booking.status = 'confirmed';
+  booking.paymentStatus = 'paid';
+  booking.paymentProvider = paymentProvider || 'unknown';
+  booking.transactionId = transactionId || makeId('TXN');
+  booking.confirmedAt = new Date().toISOString();
+
+  io.emit('booking-update', {
+    bookingId: booking.bookingId,
+    status: booking.status,
+    busId: booking.busId,
+    seats: booking.seats,
+    transactionId: booking.transactionId
+  });
+
+  return res.json({
+    status: 'confirmed',
+    ticket: {
+      ticketId: makeId('TKT'),
+      bookingId: booking.bookingId,
+      busId: booking.busId,
+      seats: booking.seats,
+      amount: booking.amount,
+      paymentProvider: booking.paymentProvider,
+      transactionId: booking.transactionId,
+      confirmedAt: booking.confirmedAt
+    },
+    booking: bookingPublicView(booking)
+  });
+});
+
+app.post('/api/payment/fail', (req, res) => {
+  const { bookingId, reason } = req.body;
+  const booking = bookingLedger.find((item) => item.bookingId === bookingId);
+  if (!booking) {
+    return res.status(404).json({ error: 'Booking not found' });
+  }
+
+  if (booking.status === 'confirmed') {
+    return res.status(400).json({ error: 'Booking already confirmed, cannot mark failed' });
+  }
+
+  booking.status = 'failed';
+  booking.paymentStatus = 'failed';
+  booking.failedAt = new Date().toISOString();
+  booking.failureReason = reason || 'Payment failed';
+
+  return res.json({ status: 'failed', booking: bookingPublicView(booking) });
+});
+
+app.post('/api/payment/webhook/razorpay', (req, res) => {
+  // Hackathon-safe placeholder for webhook integration.
+  // In production, verify HMAC signature with RAZORPAY_WEBHOOK_SECRET.
+  const event = req.body?.event || 'unknown';
+  return res.json({ status: 'received', event, note: 'Implement signature verification for production' });
+});
+
+setInterval(() => {
+  const now = nowMs();
+  let expiredCount = 0;
+  bookingLedger.forEach((booking) => {
+    if (booking.status === 'pending' && booking.expiresAtMs <= now) {
+      booking.status = 'expired';
+      booking.paymentStatus = 'not_collected';
+      booking.failureReason = 'Booking hold expired';
+      expiredCount += 1;
+    }
+  });
+
+  if (expiredCount > 0) {
+    io.emit('booking-expired', { count: expiredCount, at: new Date().toISOString() });
+  }
+}, 10000);
 
 io.on('connection', (socket) => {
   console.log('Client connected for live tracking');

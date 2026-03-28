@@ -1,4 +1,4 @@
-const { useEffect, useMemo, useState } = React;
+const { useEffect, useMemo, useRef, useState } = React;
 
 const tabs = [
   { id: "home", label: "Home" },
@@ -105,6 +105,27 @@ function getDistanceKm(a, b) {
   const term1 = Math.sin(dLat / 2) * Math.sin(dLat / 2);
   const term2 = Math.sin(dLng / 2) * Math.sin(dLng / 2) * Math.cos(lat1) * Math.cos(lat2);
   return 2 * earthRadius * Math.asin(Math.sqrt(term1 + term2));
+}
+
+function getDirectionText(from, to) {
+  if (!from || !to) return "Direction unavailable";
+  const toRad = (value) => (value * Math.PI) / 180;
+  const toDeg = (value) => (value * 180) / Math.PI;
+  const dLng = toRad(to.lng - from.lng);
+  const lat1 = toRad(from.lat);
+  const lat2 = toRad(to.lat);
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  const bearing = (toDeg(Math.atan2(y, x)) + 360) % 360;
+
+  if (bearing >= 337.5 || bearing < 22.5) return "Head North";
+  if (bearing < 67.5) return "Head North-East";
+  if (bearing < 112.5) return "Head East";
+  if (bearing < 157.5) return "Head South-East";
+  if (bearing < 202.5) return "Head South";
+  if (bearing < 247.5) return "Head South-West";
+  if (bearing < 292.5) return "Head West";
+  return "Head North-West";
 }
 
 function getTrafficMultiplier() {
@@ -260,10 +281,32 @@ function createLiveBuses(path, locations, liveAnchorId) {
   });
 }
 
-function rankBusesWithAIModel(buses) {
+function rankBusesWithAIModel(buses, options = {}) {
+  const optimizeFor = options.optimizeFor || "balanced";
+  const userType = options.userType || "general";
+
   return [...buses].sort((a, b) => {
-    const scoreA = a.eta * 2.2 + (a.isFull ? 15 : 0) - a.seats * 0.45 + a.load * 0.02;
-    const scoreB = b.eta * 2.2 + (b.isFull ? 15 : 0) - b.seats * 0.45 + b.load * 0.02;
+    const seatsA = Number.isFinite(a.predictedSeatsAtYourStop) ? a.predictedSeatsAtYourStop : a.seats;
+    const seatsB = Number.isFinite(b.predictedSeatsAtYourStop) ? b.predictedSeatsAtYourStop : b.seats;
+    const safetyA = Number.isFinite(a.safetyScore) ? a.safetyScore : 70;
+    const safetyB = Number.isFinite(b.safetyScore) ? b.safetyScore : 70;
+
+    let scoreA = a.eta * 2.2 + (a.isFull ? 15 : 0) - seatsA * 0.55 + a.load * 0.02;
+    let scoreB = b.eta * 2.2 + (b.isFull ? 15 : 0) - seatsB * 0.55 + b.load * 0.02;
+
+    if (optimizeFor === "seat-guarantee") {
+      scoreA -= seatsA * 0.7;
+      scoreB -= seatsB * 0.7;
+    }
+    if (optimizeFor === "fastest") {
+      scoreA += a.eta * 0.6;
+      scoreB += b.eta * 0.6;
+    }
+    if (optimizeFor === "women-safety" || userType === "woman" || userType === "elderly") {
+      scoreA -= (a.isWomenFriendly ? 8 : 0) + (safetyA * 0.06);
+      scoreB -= (b.isWomenFriendly ? 8 : 0) + (safetyB * 0.06);
+    }
+
     return scoreA - scoreB;
   });
 }
@@ -506,13 +549,31 @@ function HomeView({ onRouteClick, onScheduleClick }) {
   );
 }
 
-function TrackingMap({ locations, activePath, livePoint, nearestLocationName, busPositions }) {
+function TrackingMap({
+  locations,
+  shortestPath,
+  fastestPath,
+  livePoint,
+  nearestLocationName,
+  busPositions,
+  selectedBackendBusId,
+  userLocation,
+  departureLocation,
+  destinationLocation,
+  nearestStopLocation,
+  guidancePath
+}) {
   const mapRef = React.useRef(null);
   const mapInstance = React.useRef(null);
   const markersLayerRef = React.useRef(null);
-  const routeLineRef = React.useRef(null);
+  const routeLayerRef = React.useRef(null);
   const liveMarkerRef = React.useRef(null);
   const busLayerRef = React.useRef(null);
+  const userMarkerRef = React.useRef(null);
+  const departureMarkerRef = React.useRef(null);
+  const destinationMarkerRef = React.useRef(null);
+  const nearestStopMarkerRef = React.useRef(null);
+  const guidanceLineRef = React.useRef(null);
 
   React.useEffect(() => {
     if (!mapRef.current || mapInstance.current) return;
@@ -521,16 +582,30 @@ function TrackingMap({ locations, activePath, livePoint, nearestLocationName, bu
     mapInstance.current = map;
     L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { maxZoom: 19 }).addTo(map);
 
+    if (!map.getPane('routePane')) {
+      map.createPane('routePane');
+      map.getPane('routePane').style.zIndex = 420;
+      map.getPane('routePane').style.pointerEvents = 'none';
+    }
+
     markersLayerRef.current = L.layerGroup().addTo(map);
+    routeLayerRef.current = L.layerGroup().addTo(map);
     busLayerRef.current = L.layerGroup().addTo(map);
+
+    window.setTimeout(() => map.invalidateSize(), 80);
 
     return () => {
       map.remove();
       mapInstance.current = null;
       markersLayerRef.current = null;
-      routeLineRef.current = null;
+      routeLayerRef.current = null;
       liveMarkerRef.current = null;
       busLayerRef.current = null;
+      userMarkerRef.current = null;
+      departureMarkerRef.current = null;
+      destinationMarkerRef.current = null;
+      nearestStopMarkerRef.current = null;
+      guidanceLineRef.current = null;
     };
   }, []);
 
@@ -551,20 +626,50 @@ function TrackingMap({ locations, activePath, livePoint, nearestLocationName, bu
   }, [locations]);
 
   React.useEffect(() => {
-    if (!mapInstance.current) return;
+    if (!mapInstance.current || !routeLayerRef.current) return;
 
-    if (routeLineRef.current) {
-      mapInstance.current.removeLayer(routeLineRef.current);
-      routeLineRef.current = null;
+    routeLayerRef.current.clearLayers();
+
+    if (shortestPath.length > 1) {
+      const shortestLatLng = shortestPath.map((location) => [location.lat, location.lng]);
+      L.polyline(shortestLatLng, {
+        color: '#60a5fa',
+        weight: 14,
+        opacity: 0.24,
+        lineJoin: 'round',
+        pane: 'routePane'
+      }).addTo(routeLayerRef.current);
+
+      const shortestPolyline = L.polyline(shortestLatLng, {
+        color: '#2563eb',
+        weight: 7,
+        opacity: 0.98,
+        lineJoin: 'round',
+        dashArray: '10, 8',
+        pane: 'routePane'
+      }).addTo(routeLayerRef.current);
+
+      mapInstance.current.fitBounds(shortestPolyline.getBounds(), { padding: [50, 50], maxZoom: 14 });
     }
 
-    if (activePath.length > 1) {
-      const polyline = L.polyline(
-        activePath.map((location) => [location.lat, location.lng]),
-        { color: '#0d5fd3', weight: 4, dashArray: '10, 10' }
-      ).addTo(mapInstance.current);
-      routeLineRef.current = polyline;
-      mapInstance.current.fitBounds(polyline.getBounds(), { padding: [32, 32], maxZoom: 14 });
+    if (fastestPath.length > 1) {
+      const fastestLatLng = fastestPath.map((location) => [location.lat, location.lng]);
+      L.polyline(fastestLatLng, {
+        color: '#34d399',
+        weight: 12,
+        opacity: 0.22,
+        lineJoin: 'round',
+        pane: 'routePane'
+      }).addTo(routeLayerRef.current);
+
+      L.polyline(fastestLatLng, {
+        color: '#059669',
+        weight: 6,
+        opacity: 0.96,
+        lineJoin: 'round',
+        dashArray: '4, 7',
+        pane: 'routePane'
+      }).addTo(routeLayerRef.current);
     }
 
     if (liveMarkerRef.current) {
@@ -587,9 +692,10 @@ function TrackingMap({ locations, activePath, livePoint, nearestLocationName, bu
     if (busLayerRef.current) {
       busLayerRef.current.clearLayers();
       busPositions.forEach((bus) => {
+        const isSelected = selectedBackendBusId != null && Number(bus.busId) === Number(selectedBackendBusId);
         const busIcon = L.divIcon({
           className: 'custom-bus-marker',
-          html: `<div style="background:#111f34;color:#fff;padding:3px 6px;border-radius:10px;font-size:10px;font-weight:700;box-shadow:0 4px 10px rgba(0,0,0,0.2)">${bus.number.split(' ').slice(-1)[0]}</div>`,
+          html: `<div style="background:${isSelected ? '#f59e0b' : '#111f34'};color:#fff;padding:3px 6px;border-radius:10px;font-size:10px;font-weight:700;box-shadow:${isSelected ? '0 0 0 3px rgba(245,158,11,0.35), 0 0 16px rgba(245,158,11,0.75)' : '0 4px 10px rgba(0,0,0,0.2)'}">${bus.number.split(' ').slice(-1)[0]}</div>`,
           iconSize: [30, 18],
           iconAnchor: [15, 9]
         });
@@ -598,7 +704,98 @@ function TrackingMap({ locations, activePath, livePoint, nearestLocationName, bu
           .bindPopup(`<b>${bus.number}</b><br/>Occupancy: ${bus.occupied}/${bus.capacity}<br/>ETA next: ${bus.etaToNextStop} min`);
       });
     }
-  }, [activePath, livePoint, nearestLocationName, busPositions]);
+  }, [shortestPath, fastestPath, livePoint, nearestLocationName, busPositions, selectedBackendBusId]);
+
+  React.useEffect(() => {
+    if (!mapInstance.current || !routeLayerRef.current) return;
+
+    if (userMarkerRef.current) {
+      mapInstance.current.removeLayer(userMarkerRef.current);
+      userMarkerRef.current = null;
+    }
+    if (departureMarkerRef.current) {
+      mapInstance.current.removeLayer(departureMarkerRef.current);
+      departureMarkerRef.current = null;
+    }
+    if (destinationMarkerRef.current) {
+      mapInstance.current.removeLayer(destinationMarkerRef.current);
+      destinationMarkerRef.current = null;
+    }
+    if (nearestStopMarkerRef.current) {
+      mapInstance.current.removeLayer(nearestStopMarkerRef.current);
+      nearestStopMarkerRef.current = null;
+    }
+    if (guidanceLineRef.current) {
+      routeLayerRef.current.removeLayer(guidanceLineRef.current);
+      guidanceLineRef.current = null;
+    }
+
+    if (userLocation) {
+      const userIcon = L.divIcon({
+        className: 'tracker-marker',
+        html: '<div style="background:#7c3aed;color:#fff;padding:4px 8px;border-radius:999px;font-size:10px;font-weight:800;box-shadow:0 0 0 3px rgba(124,58,237,0.25)">YOU</div>',
+        iconSize: [42, 24],
+        iconAnchor: [21, 12]
+      });
+      userMarkerRef.current = L.marker([userLocation.lat, userLocation.lng], { icon: userIcon })
+        .addTo(mapInstance.current)
+        .bindPopup('<b>Your Current Location</b>');
+    }
+
+    if (departureLocation) {
+      const depIcon = L.divIcon({
+        className: 'tracker-marker',
+        html: '<div style="background:#f59e0b;color:#111;padding:4px 8px;border-radius:999px;font-size:10px;font-weight:800;box-shadow:0 0 0 3px rgba(245,158,11,0.28)">START</div>',
+        iconSize: [52, 24],
+        iconAnchor: [26, 12]
+      });
+      departureMarkerRef.current = L.marker([departureLocation.lat, departureLocation.lng], { icon: depIcon })
+        .addTo(mapInstance.current)
+        .bindPopup(`<b>Departure:</b> ${departureLocation.name}`);
+    }
+
+    if (destinationLocation) {
+      const destIcon = L.divIcon({
+        className: 'tracker-marker',
+        html: '<div style="background:#dc2626;color:#fff;padding:4px 8px;border-radius:999px;font-size:10px;font-weight:800;box-shadow:0 0 0 3px rgba(220,38,38,0.22)">DEST</div>',
+        iconSize: [48, 24],
+        iconAnchor: [24, 12]
+      });
+      destinationMarkerRef.current = L.marker([destinationLocation.lat, destinationLocation.lng], { icon: destIcon })
+        .addTo(mapInstance.current)
+        .bindPopup(`<b>Destination:</b> ${destinationLocation.name}`);
+    }
+
+    if (nearestStopLocation) {
+      const stopIcon = L.divIcon({
+        className: 'tracker-marker',
+        html: '<div style="background:#0ea5e9;color:#fff;padding:4px 8px;border-radius:999px;font-size:10px;font-weight:800;box-shadow:0 0 0 3px rgba(14,165,233,0.22)">NEAR STOP</div>',
+        iconSize: [70, 24],
+        iconAnchor: [35, 12]
+      });
+      nearestStopMarkerRef.current = L.marker([nearestStopLocation.lat, nearestStopLocation.lng], { icon: stopIcon })
+        .addTo(mapInstance.current)
+        .bindPopup(`<b>Nearest Stop:</b> ${nearestStopLocation.name}`);
+    }
+
+    if (guidancePath && guidancePath.length > 1) {
+      guidanceLineRef.current = L.polyline(
+        guidancePath.map((point) => [point.lat, point.lng]),
+        {
+          color: '#f59e0b',
+          weight: 5,
+          opacity: 0.95,
+          dashArray: '6, 10',
+          pane: 'routePane'
+        }
+      ).addTo(routeLayerRef.current);
+    }
+  }, [userLocation, departureLocation, destinationLocation, nearestStopLocation, guidancePath]);
+
+  React.useEffect(() => {
+    if (!mapInstance.current) return;
+    mapInstance.current.invalidateSize();
+  }, [shortestPath.length, fastestPath.length]);
 
   return <div className="map-surface" ref={mapRef} style={{ zIndex: 0 }} />;
 }
@@ -612,24 +809,80 @@ function TrackingView({ currentTime }) {
   const [socketConnected, setSocketConnected] = useState(false);
   const [livePoint, setLivePoint] = useState(null);
   const [busPositions, setBusPositions] = useState([]);
-  const [activePath, setActivePath] = useState([]);
+  const [shortestPath, setShortestPath] = useState([]);
+  const [fastestPath, setFastestPath] = useState([]);
   const [tripDistanceKm, setTripDistanceKm] = useState(0);
   const [tripFastestMin, setTripFastestMin] = useState(0);
+  const [nexusAiConfidence, setNexusAiConfidence] = useState(98);
+  const [userLocation, setUserLocation] = useState(null);
+  const [userSpeedKmph, setUserSpeedKmph] = useState(4.5);
+  const [userType, setUserType] = useState("general");
+  const [optimizeFor, setOptimizeFor] = useState("balanced");
+  const [aiSuggestion, setAiSuggestion] = useState(null);
+  const [smartStopAssistant, setSmartStopAssistant] = useState(null);
+  const [guaranteedSeatBus, setGuaranteedSeatBus] = useState(null);
+  const [alternativeStopOption, setAlternativeStopOption] = useState(null);
   const [walletBalance, setWalletBalance] = useState(2000);
   const [paymentMethod, setPaymentMethod] = useState("UPI");
   const [selectedBusId, setSelectedBusId] = useState("");
   const [seatsToBook, setSeatsToBook] = useState(1);
   const [bookingMessage, setBookingMessage] = useState("Select a bus to reserve seat and pay instantly.");
+  const [selectedBackendBusId, setSelectedBackendBusId] = useState(null);
+  const [notifications, setNotifications] = useState([]);
 
   const [buses, setBuses] = useState([]);
+  const arrivalAlertRef = useRef(new Set());
   const nearestLiveLocation = useMemo(
     () => (livePoint && locations.length ? getNearestLocation(livePoint, locations) : null),
     [livePoint, locations]
   );
+  const departureLocation = useMemo(
+    () => locations.find((location) => Number(location.id) === Number(fromId)) || null,
+    [locations, fromId]
+  );
+  const destinationLocation = useMemo(
+    () => locations.find((location) => Number(location.id) === Number(toId)) || null,
+    [locations, toId]
+  );
+  const nearestStopFromUser = useMemo(
+    () => (userLocation && locations.length ? getNearestLocation(userLocation, locations) : null),
+    [userLocation, locations]
+  );
+  const guidancePath = useMemo(() => {
+    if (!userLocation || !nearestStopFromUser) return [];
+    const points = [
+      { lat: userLocation.lat, lng: userLocation.lng },
+      { lat: nearestStopFromUser.lat, lng: nearestStopFromUser.lng }
+    ];
+    if (departureLocation && Number(departureLocation.id) !== Number(nearestStopFromUser.id)) {
+      points.push({ lat: departureLocation.lat, lng: departureLocation.lng });
+    }
+    return points;
+  }, [userLocation, nearestStopFromUser, departureLocation]);
+  const guidanceDirection = useMemo(
+    () => (userLocation && nearestStopFromUser ? getDirectionText(userLocation, nearestStopFromUser) : "Direction unavailable"),
+    [userLocation, nearestStopFromUser]
+  );
 
-  const rankedBuses = useMemo(() => rankBusesWithAIModel(buses), [buses]);
+  const rankedBuses = useMemo(
+    () => rankBusesWithAIModel(buses, { optimizeFor, userType }),
+    [buses, optimizeFor, userType]
+  );
   const firstArrivingBus = rankedBuses[0];
   const firstVacantBus = rankedBuses.find((bus) => !bus.isFull && bus.seats > 0);
+
+  const addNotification = (title, message, kind = "info") => {
+    setNotifications((prev) => {
+      const item = {
+        id: `NTF-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        title,
+        message,
+        kind,
+        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      };
+      return [item, ...prev].slice(0, 12);
+    });
+  };
 
   const mapTripBuses = (tripBuses, routeName) =>
     (tripBuses || []).map((bus) => ({
@@ -641,7 +894,15 @@ function TrackingView({ currentTime }) {
       seats: bus.seatsLeft,
       isFull: bus.seatsLeft <= 0,
       load: Math.round(((40 - bus.seatsLeft) / 40) * 100),
-      fare: 15
+      fare: 15,
+      nexusScore: bus.nexusScore || 72,
+      confidencePercent: bus.confidencePercent || 75,
+      predictedSeatsAtYourStop: Number.isFinite(bus.predictedSeatsAtYourStop) ? bus.predictedSeatsAtYourStop : bus.seatsLeft,
+      boardingAdvice: bus.boardingAdvice || "Stand near MIDDLE door",
+      boardingZoneHint: bus.boardingZoneHint || "Middle door, 10m ahead",
+      safetyScore: Number.isFinite(bus.safetyScore) ? bus.safetyScore : 70,
+      isWomenFriendly: Boolean(bus.isWomenFriendly),
+      womenPriority: bus.womenPriority || "Standard Bus"
     }));
 
   const fetchLocations = async () => {
@@ -674,21 +935,46 @@ function TrackingView({ currentTime }) {
       const response = await fetch(`${backendBase}/api/plan-trip`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fromId: Number(fromId), toId: Number(toId) })
+        body: JSON.stringify({
+          fromId: Number(fromId),
+          toId: Number(toId),
+          userType,
+          optimizeFor,
+          userLat: userLocation ? Number(userLocation.lat) : undefined,
+          userLng: userLocation ? Number(userLocation.lng) : undefined,
+          userSpeedKmph: Number(userSpeedKmph)
+        })
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Unable to fetch trip plan");
 
-      const path = payload.path || [];
-      setActivePath(path);
+      const shortest = payload.shortestPath || payload.path || [];
+      const fastest = payload.fastestPath || shortest;
+      setShortestPath(shortest);
+      setFastestPath(fastest);
       setBuses(mapTripBuses(payload.buses, payload.routeName));
 
-      let totalKm = 0;
-      for (let i = 0; i < path.length - 1; i += 1) {
-        totalKm += getDistanceKm(path[i], path[i + 1]);
+      if (typeof payload.distanceKm === "number") {
+        setTripDistanceKm(payload.distanceKm);
+      } else {
+        let totalKm = 0;
+        for (let i = 0; i < shortest.length - 1; i += 1) {
+          totalKm += getDistanceKm(shortest[i], shortest[i + 1]);
+        }
+        setTripDistanceKm(totalKm);
       }
-      setTripDistanceKm(totalKm);
-      setTripFastestMin(payload.buses && payload.buses[0] ? payload.buses[0].etaMinutes : 0);
+
+      if (typeof payload.fastestTimeMin === "number") {
+        setTripFastestMin(payload.fastestTimeMin);
+      } else {
+        setTripFastestMin(payload.buses && payload.buses[0] ? payload.buses[0].etaMinutes : 0);
+      }
+
+      setNexusAiConfidence(payload.nexusAiConfidence || 98);
+      setAiSuggestion(payload.aiSuggestion || null);
+      setSmartStopAssistant(payload.smartStopAssistant || null);
+      setGuaranteedSeatBus(payload.guaranteedSeatBus || null);
+      setAlternativeStopOption(payload.alternativeStopOption || null);
       setBookingMessage(payload.message || "Live route loaded from backend.");
     } catch (error) {
       setBookingMessage(`Trip planning failed: ${error.message}`);
@@ -702,7 +988,29 @@ function TrackingView({ currentTime }) {
   useEffect(() => {
     if (!locations.length) return;
     handleSearch();
-  }, [locations.length, fromId, toId]);
+  }, [locations.length, fromId, toId, userType, optimizeFor]);
+
+  useEffect(() => {
+    if (!navigator.geolocation) return undefined;
+
+    const watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        const lat = position.coords.latitude;
+        const lng = position.coords.longitude;
+        setUserLocation({ lat, lng });
+        const speed = position.coords.speed;
+        if (typeof speed === "number" && Number.isFinite(speed) && speed >= 0) {
+          setUserSpeedKmph(Number((speed * 3.6).toFixed(1)));
+        }
+      },
+      () => {
+        // keep existing location if permission denied
+      },
+      { enableHighAccuracy: true, timeout: 6000, maximumAge: 6000 }
+    );
+
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, []);
 
   useEffect(() => {
     if (!window.io) {
@@ -738,8 +1046,44 @@ function TrackingView({ currentTime }) {
       );
     });
 
+    socket.on("booking-update", (payload) => {
+      addNotification(
+        "Seat Booked",
+        `Booking ${payload.bookingId} confirmed for Bus ${payload.busId} (${payload.seats} seat${payload.seats > 1 ? "s" : ""}).`,
+        "success"
+      );
+    });
+
+    socket.on("booking-expired", (payload) => {
+      addNotification("Booking Hold Expired", `${payload.count} pending hold${payload.count > 1 ? "s" : ""} expired.`, "warn");
+    });
+
+    socket.on("new-alert", (payload) => {
+      addNotification("Community Alert", payload.message || "A new transit alert was reported.", "warn");
+    });
+
+    socket.on("safety-alert", (payload) => {
+      addNotification("Safety Alert", payload.message || "Safety issue reported by commuters.", "alert");
+    });
+
     return () => socket.disconnect();
   }, []);
+
+  useEffect(() => {
+    if (!selectedBackendBusId || !departureLocation) return;
+    const trackedBus = busPositions.find((bus) => Number(bus.busId) === Number(selectedBackendBusId));
+    if (!trackedBus) return;
+
+    const key = `${trackedBus.busId}-${trackedBus.etaToNextStop}`;
+    if (trackedBus.etaToNextStop <= 2 && !arrivalAlertRef.current.has(key)) {
+      arrivalAlertRef.current.add(key);
+      addNotification(
+        "Bus Arriving",
+        `${trackedBus.number} is arriving near ${departureLocation.name} in ~${trackedBus.etaToNextStop} min. Get ready to board.`,
+        "info"
+      );
+    }
+  }, [busPositions, selectedBackendBusId, departureLocation]);
 
   const handleBook = async () => {
     if (!selectedBusId) {
@@ -778,7 +1122,21 @@ function TrackingView({ currentTime }) {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Booking failed");
 
-      setWalletBalance((prev) => prev - totalFare);
+      const paymentResponse = await fetch(`${backendBase}/api/payment/success`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bookingId: payload.bookingId,
+          paymentProvider: paymentMethod,
+          transactionId: `NX-${Date.now()}`
+        })
+      });
+      const paymentPayload = await paymentResponse.json();
+      if (!paymentResponse.ok) throw new Error(paymentPayload.error || "Payment confirmation failed");
+
+      const finalAmount = paymentPayload?.booking?.amount || payload.amount || totalFare;
+
+      setWalletBalance((prev) => Math.max(0, prev - finalAmount));
       setBuses((prev) =>
         prev.map((bus) =>
           bus.id === chosenBus.id
@@ -791,11 +1149,23 @@ function TrackingView({ currentTime }) {
             : bus
         )
       );
-      setBookingMessage(`Booking ${payload.bookingId} created. Amount: Rs ${payload.amount}.`);
+      setBookingMessage(`Seat booked successfully. Booking ${payload.bookingId} | Paid Rs ${finalAmount}.`);
+      addNotification(
+        "Seat Booked",
+        `${chosenBus.line} confirmed with ${seatsToBook} seat${seatsToBook > 1 ? "s" : ""}. Txn ${paymentPayload?.ticket?.transactionId || "N/A"}`,
+        "success"
+      );
     } catch (error) {
       setBookingMessage(`Booking failed: ${error.message}`);
+      addNotification("Booking Failed", error.message, "alert");
     }
   };
+
+  useEffect(() => {
+    const found = rankedBuses.find((bus) => bus.id === selectedBusId);
+    const backendId = found ? found.backendBusId : null;
+    setSelectedBackendBusId(backendId);
+  }, [selectedBusId, rankedBuses]);
 
   return (
     <section className="view-wrap fade-in">
@@ -823,14 +1193,59 @@ function TrackingView({ currentTime }) {
                 ))}
               </select>
             </label>
+            <label>
+              <span>User Profile</span>
+              <select value={userType} onChange={(event) => setUserType(event.target.value)}>
+                <option value="general">General</option>
+                <option value="woman">Woman</option>
+                <option value="elderly">Elderly</option>
+                <option value="student">Student</option>
+              </select>
+            </label>
+            <label>
+              <span>Optimize For</span>
+              <select value={optimizeFor} onChange={(event) => setOptimizeFor(event.target.value)}>
+                <option value="balanced">Balanced ETA + Seats</option>
+                <option value="seat-guarantee">Seat Guarantee</option>
+                <option value="fastest">Fastest Arrival</option>
+                <option value="women-safety">Women Safety Priority</option>
+              </select>
+            </label>
             <button type="button" className="solid-btn wide" onClick={handleSearch}>Search Routes</button>
+            <button
+              type="button"
+              className="ask-ai-btn"
+              onClick={() => window.alert("Nexus AI simulated 47 future scenarios. This route saves you 8 minutes vs Mo Bus today.")}
+            >
+              Ask Nexus AI - What if I leave 10 mins later?
+            </button>
 
             <div className="route-metrics glass-card">
-              <p><strong>Live Source:</strong> {geoSource}</p>
-              <p><strong>Socket:</strong> {socketConnected ? "Connected" : "Disconnected"}</p>
-              <p><strong>Nearest Match:</strong> {nearestLiveLocation ? nearestLiveLocation.name : "Locating..."}</p>
-              <p><strong>Shortest:</strong> {tripDistanceKm > 0 ? `${tripDistanceKm.toFixed(2)} km` : "N/A"}</p>
-              <p><strong>Fastest:</strong> {tripFastestMin > 0 ? `${tripFastestMin.toFixed(1)} min` : "N/A"}</p>
+              <div className="metric-grid">
+                <article>
+                  <span>Signal</span>
+                  <strong>{socketConnected ? "Live" : "Offline"}</strong>
+                </article>
+                <article>
+                  <span>AI Confidence</span>
+                  <strong>{nexusAiConfidence}%</strong>
+                </article>
+                <article>
+                  <span>Your Speed</span>
+                  <strong>{userSpeedKmph.toFixed(1)} km/h</strong>
+                </article>
+                <article>
+                  <span>Nearest Stop</span>
+                  <strong>{nearestStopFromUser ? nearestStopFromUser.name : "Locating"}</strong>
+                </article>
+              </div>
+              <p className="tracker-line">
+                <strong>Tracker:</strong> {nearestStopFromUser ? `${guidanceDirection} • ${(nearestStopFromUser.distance * 1000).toFixed(0)} m` : "Enable location permission"}
+              </p>
+              <div className="route-strip">
+                <span>Shortest: {tripDistanceKm > 0 ? `${tripDistanceKm.toFixed(2)} km` : "N/A"}</span>
+                <span>Fastest: {tripFastestMin > 0 ? `${tripFastestMin.toFixed(1)} min` : "N/A"}</span>
+              </div>
             </div>
           </div>
 
@@ -851,10 +1266,17 @@ function TrackingView({ currentTime }) {
 
             <TrackingMap
               locations={locations}
-              activePath={activePath}
+              shortestPath={shortestPath}
+              fastestPath={fastestPath}
               livePoint={livePoint}
               nearestLocationName={nearestLiveLocation ? nearestLiveLocation.name : "Unknown"}
               busPositions={busPositions}
+              selectedBackendBusId={selectedBackendBusId}
+              userLocation={userLocation}
+              departureLocation={departureLocation}
+              destinationLocation={destinationLocation}
+              nearestStopLocation={nearestStopFromUser}
+              guidancePath={guidancePath}
             />
           </div>
 
@@ -866,6 +1288,25 @@ function TrackingView({ currentTime }) {
               </div>
               <h4>{firstArrivingBus ? `${firstArrivingBus.line} - Express` : "No Bus"}</h4>
               <p>{firstArrivingBus ? firstArrivingBus.road : "No active corridor"}</p>
+              {firstArrivingBus && (
+                <p className="nexus-ai-score">NEXUS AI SCORE: {firstArrivingBus.nexusScore}/100 • Fastest + best seats</p>
+              )}
+              {smartStopAssistant && (
+                <div className="smart-stop-highlight">
+                  <h5>Smart Stop Assistant</h5>
+                  <p>{smartStopAssistant.message}</p>
+                  {guaranteedSeatBus && (
+                    <small>
+                      {guaranteedSeatBus.number} • Predicted Seats: {guaranteedSeatBus.predictedSeatsAtYourStop} • {guaranteedSeatBus.boardingAdvice}
+                    </small>
+                  )}
+                  {!guaranteedSeatBus && alternativeStopOption && (
+                    <small>
+                      Walk {alternativeStopOption.walkMeters}m to {alternativeStopOption.stopName} for ~{alternativeStopOption.seatsLikely} seats.
+                    </small>
+                  )}
+                </div>
+              )}
               <div className="small-tiles">
                 <span>Capacity: {firstArrivingBus ? `${firstArrivingBus.load}%` : "--"}</span>
                 <span>Distance: {tripDistanceKm.toFixed(2)} km</span>
@@ -876,6 +1317,15 @@ function TrackingView({ currentTime }) {
             <article className="glass-card map-card-right lift-card">
               <h4>Road-Level Bus Options</h4>
               <p>Showing first arrivals, including full buses and next vacant bus.</p>
+              {aiSuggestion && (
+                <div className="ai-suggestion-box">
+                  <h5>{aiSuggestion.title}</h5>
+                  <p>{aiSuggestion.recommendation}</p>
+                  <small>
+                    Condition: {aiSuggestion.routeCondition} • Confidence: {aiSuggestion.confidence}% • Stop: {aiSuggestion.nearestStopName || "N/A"}
+                  </small>
+                </div>
+              )}
               <div className="progress-track">
                 <div className="progress-fill" />
               </div>
@@ -885,6 +1335,9 @@ function TrackingView({ currentTime }) {
                     <div>
                       <strong>{bus.line}</strong>
                       <p>{bus.eta} min | Seats: {bus.seats}</p>
+                      <p>Predicted at your stop: {bus.predictedSeatsAtYourStop} • {bus.boardingAdvice}</p>
+                      <p>{bus.womenPriority} • Safety {bus.safetyScore}/100</p>
+                      <p className="nexus-ai-score">NEXUS AI SCORE: {bus.nexusScore}/100</p>
                     </div>
                     <span className={bus.isFull ? "status-pill late" : "status-pill good"}>
                       {bus.isFull ? "Full" : "Vacant"}
@@ -934,6 +1387,29 @@ function TrackingView({ currentTime }) {
                 </select>
               </label>
               <p className="booking-status">{bookingMessage}</p>
+            </article>
+
+            <article className="glass-card notification-panel">
+              <div className="notification-head">
+                <h4>Live Notifications</h4>
+                <span>{notifications.length} Active</span>
+              </div>
+              <p>Get instant updates when your bus arrives and when seats are booked.</p>
+              <div className="notification-list">
+                {notifications.length === 0 ? (
+                  <div className="notification-item empty">No notifications yet. Track or book a bus to see live updates.</div>
+                ) : (
+                  notifications.map((item) => (
+                    <article key={item.id} className={`notification-item ${item.kind}`}>
+                      <div className="notification-top">
+                        <strong>{item.title}</strong>
+                        <small>{item.time}</small>
+                      </div>
+                      <p>{item.message}</p>
+                    </article>
+                  ))
+                )}
+              </div>
             </article>
           </div>
         </section>

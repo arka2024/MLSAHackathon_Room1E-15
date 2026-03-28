@@ -823,6 +823,36 @@ select:focus {
   height: 100%;
 }
 
+.shortest-path {
+  filter: drop-shadow(0 0 6px rgba(59, 130, 246, 0.75));
+  animation: pulseBlue 2s ease-in-out infinite;
+}
+
+.fastest-path {
+  filter: drop-shadow(0 0 6px rgba(16, 185, 129, 0.8));
+  animation: pulseGreen 2s ease-in-out infinite;
+}
+
+@keyframes pulseBlue {
+  0%,
+  100% {
+    opacity: 0.95;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes pulseGreen {
+  0%,
+  100% {
+    opacity: 0.95;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
 .line-main {
   fill: none;
   stroke: #0d5fd3;
@@ -873,10 +903,10 @@ select:focus {
 
 .route-metrics {
   margin-top: 0.6rem;
-  padding: 0.6rem;
+  padding: 0.68rem;
   border-radius: 12px;
   display: grid;
-  gap: 0.3rem;
+  gap: 0.46rem;
   font-size: 0.8rem;
 }
 
@@ -884,10 +914,112 @@ select:focus {
   color: #354a62;
 }
 
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.42rem;
+}
+
+.metric-grid article {
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(53, 79, 111, 0.16);
+  border-radius: 10px;
+  padding: 0.45rem 0.5rem;
+  display: grid;
+  gap: 0.16rem;
+}
+
+.metric-grid span {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #5f7388;
+  font-weight: 800;
+}
+
+.metric-grid strong {
+  font-size: 0.86rem;
+  color: #19314a;
+}
+
+.tracker-line {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #334a62;
+}
+
+.route-strip {
+  display: flex;
+  gap: 0.46rem;
+  flex-wrap: wrap;
+}
+
+.route-strip span {
+  border-radius: 999px;
+  background: rgba(13, 95, 211, 0.1);
+  color: #0f4fa9;
+  padding: 0.22rem 0.55rem;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.ask-ai-btn {
+  margin-top: 0.55rem;
+  width: 100%;
+  border-radius: 14px;
+  padding: 0.72rem 0.8rem;
+  font-weight: 800;
+  color: #fff;
+  background: linear-gradient(110deg, #4c1d95, #1d4ed8);
+  box-shadow: 0 10px 24px rgba(52, 64, 180, 0.34);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.ask-ai-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 28px rgba(52, 64, 180, 0.42);
+}
+
+.nexus-ai-score {
+  margin-top: 0.35rem;
+  font-size: 0.72rem;
+  color: #5b21b6;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
 .bus-list {
   display: grid;
   gap: 0.5rem;
   margin-top: 0.5rem;
+}
+
+.ai-suggestion-box {
+  margin-top: 0.55rem;
+  border: 1px solid rgba(76, 29, 149, 0.22);
+  background: linear-gradient(120deg, rgba(124, 58, 237, 0.12), rgba(29, 78, 216, 0.09));
+  border-radius: 12px;
+  padding: 0.6rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.ai-suggestion-box h5 {
+  margin: 0;
+  color: #4c1d95;
+  font-size: 0.88rem;
+}
+
+.ai-suggestion-box p {
+  margin: 0;
+  color: #334155;
+  font-size: 0.8rem;
+}
+
+.ai-suggestion-box small {
+  color: #475569;
+  font-size: 0.72rem;
+  font-weight: 700;
 }
 
 .bus-row {
@@ -973,6 +1105,84 @@ select:focus {
   color: #30465d;
 }
 
+.notification-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.notification-head span {
+  border-radius: 999px;
+  background: rgba(13, 95, 211, 0.12);
+  color: #0f4fa9;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.55rem;
+  font-weight: 800;
+}
+
+.notification-list {
+  margin-top: 0.2rem;
+  display: grid;
+  gap: 0.45rem;
+  max-height: 236px;
+  overflow: auto;
+  padding-right: 0.2rem;
+}
+
+.notification-item {
+  border: 1px solid rgba(53, 79, 111, 0.16);
+  background: rgba(255, 255, 255, 0.72);
+  border-radius: 10px;
+  padding: 0.5rem 0.55rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.notification-item.empty {
+  color: #5a7086;
+  font-size: 0.8rem;
+}
+
+.notification-item.success {
+  border-left: 4px solid #138f4b;
+}
+
+.notification-item.warn {
+  border-left: 4px solid #a86e1c;
+}
+
+.notification-item.alert {
+  border-left: 4px solid #b4232f;
+}
+
+.notification-item.info {
+  border-left: 4px solid #155ec2;
+}
+
+.notification-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.notification-top strong {
+  font-size: 0.83rem;
+  color: #20374f;
+}
+
+.notification-top small {
+  color: #4f667d;
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.notification-item p {
+  margin: 0;
+  font-size: 0.76rem;
+}
+
 .map-card-left,
 .map-card-right {
   padding: 0.95rem;
@@ -1015,18 +1225,45 @@ select:focus {
   gap: 0.5rem;
 }
 
+.smart-stop-highlight {
+  margin-top: 0.7rem;
+  border: 1px solid rgba(8, 145, 178, 0.24);
+  background: linear-gradient(120deg, rgba(14, 165, 233, 0.14), rgba(34, 197, 94, 0.09));
+  border-radius: 12px;
+  padding: 0.55rem;
+  display: grid;
+  gap: 0.26rem;
+}
+
+.smart-stop-highlight h5 {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #0f4f8a;
+}
+
+.smart-stop-highlight p {
+  margin: 0;
+  font-size: 0.79rem;
+}
+
+.smart-stop-highlight small {
+  color: #2d4d66;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
 .small-tiles span {
   display: block;
   background: rgba(255, 255, 255, 0.74);
   border-radius: 10px;
   padding: 0.45rem 0.55rem;
   font-size: 0.82rem;
-  font-weight: 700;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .progress-track {
   margin: 0.8rem 0;
-  height: 9px;
+.monetization-panel,
+.notification-panel {
   border-radius: 999px;
   background: rgba(16, 34, 56, 0.14);
   overflow: hidden;
@@ -1035,13 +1272,15 @@ select:focus {
 .progress-fill {
   width: 78%;
   height: 100%;
-  background: linear-gradient(90deg, #0d5fd3, #1f88ff);
+.monetization-panel h4,
+.notification-panel h4 {
   border-radius: 999px;
   animation: loadBar 3.2s ease-in-out infinite;
 }
 
 @keyframes loadBar {
-  0%,
+.monetization-panel p,
+.notification-panel p {
   100% {
     width: 74%;
   }
@@ -1557,5 +1796,9 @@ select:focus {
   .footer-links {
     flex-wrap: wrap;
     gap: 0.5rem 0.8rem;
+  }
+
+  .metric-grid {
+    grid-template-columns: 1fr;
   }
 }
